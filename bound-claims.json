@@ -1,0 +1,17 @@
+{
+  "role_type": "jwt",
+  "policies": ["dev-secrets-reader"],
+  "bound_audiences": ["https://management.core.windows.net/"],
+  "bound_claims": {
+    "sub": "your-managed-identity-principal-id",
+    "appid": "your-managed-identity-client-id",
+    "tid": "your-azure-tenant-id"
+  },
+  "user_claim": "sub",
+  "claim_mappings": {
+    "oid": "managed_identity_oid",
+    "appid": "managed_identity_client_id",
+    "tid": "tenant_id"
+  },
+  "ttl": "1h"
+}

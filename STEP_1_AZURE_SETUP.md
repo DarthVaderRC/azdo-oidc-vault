@@ -2,23 +2,12 @@
 
 ## 1.1 Enable Workload Identity Federation in Azure DevOps
 
-Azure DevOps supports OIDC federation natively. The key is that AZDO issues JWT tokens with claims that Vault can validate.
+Azure DevOps supports Workload Identity Federation natively. We use **managed identity service connections** to obtain **access tokens** from Azure Entra ID. These access tokens contain claims about the managed identity (`sub`, `appid`, `tid`, `oid`) that Vault can validate via JWT auth.
 
-### AZDO OIDC Token Structure
-
-Azure DevOps JWT tokens contain these important claims:
-```json
-{
-  "sub": "sc://<org>/<project>/<service-connection-id>",
-  "aud": "api://AzureADTokenExchange",
-  "iss": "https://vstoken.dev.azure.com/<org-id>",
-  "project": "<project-name>",
-  "pipeline": "<pipeline-name>",
-  "repository": "<repo-name>",
-  "branch": "<branch-name>",
-  "environment": "<environment-name>"
-}
-```
+**Key Concept**: Instead of using Azure DevOps OIDC ID tokens (which have generic audiences and unreliable claims for managed identities), we obtain **access tokens** via `az account get-access-token --resource https://management.core.windows.net/`. These access tokens:
+- Are issued by `https://sts.windows.net/{tenant-id}/`
+- Contain managed-identity-level claims suitable for authorisation
+- Are validated by Vault against Entra ID's JWKS endpoint
 
 ## 1.2 Create Azure DevOps Organization & Project
 
@@ -71,9 +60,9 @@ steps:
         echo "This step will be replaced with Vault secret retrieval"
 ```
 
-## 1.5 Understand AZDO OIDC Token Access
+## 1.5 Understand Access Token Acquisition
 
-Azure DevOps provides OIDC tokens through:
+Azure DevOps provides access tokens through managed identity service connections:
 
 ### Azure DevOps Service Connection with Managed Identity
 
@@ -81,24 +70,16 @@ Azure DevOps provides OIDC tokens through:
 
 1. **Create Service Connection** in Azure DevOps with **Workload Identity Federation (automatic)**
 2. Azure DevOps automatically creates a **managed identity** in your subscription
-3. Pipeline uses `AzureCLI` task with the service connection
-4. Task gets **JWT token from Entra ID** (issuer: `https://login.microsoftonline.com/{tenant}/v2.0`)
-5. This JWT token is used to authenticate to Vault
+3. Pipeline uses `AzureCLI@2` task with the service connection
+4. Task gets **access token from Entra ID** via `az account get-access-token --resource https://management.core.windows.net/`
+5. This access token is used to authenticate to Vault via JWT auth
 
 **Key Benefits**:
 - ✅ No app registration needed (works with contributor permissions)
 - ✅ Managed identity created automatically
-- ✅ JWT token from Entra ID (not deprecated Azure DevOps OAuth)
+- ✅ Access token from Entra ID contains reliable MI claims (`sub`, `appid`, `tid`)
 - ✅ Token includes proper claims for Vault bound claims
 - ✅ Microsoft-recommended approach
-
-### Recommended Approach: Manual Token Extraction
-
-For POC purposes, we'll use a workaround that works with Vault:
-
-1. Azure DevOps will generate a JWT token
-2. We'll use the pipeline's identity claims
-3. Vault will validate against AZDO's OIDC discovery endpoint
 
 ## 1.6 Get Your Azure Tenant Configuration Details
 
@@ -144,19 +125,15 @@ Expected output:
 
 **Important Note**: Azure DevOps OIDC tokens are primarily designed for Azure resource access (e.g., deploying to Azure). For **generic OIDC** to external systems like Vault, we need to:
 
-### Recommended Approach: Managed Identity with Entra OAuth
-
-**Important**: Microsoft is sunsetting Azure DevOps OAuth in favor of Entra OAuth.
-
 1. **Use Managed Identity** (No app registration needed - works with contributor permissions)
 2. **Azure DevOps Service Connection** federates with Entra ID
-3. **JWT tokens issued by Entra ID** (not Azure DevOps)
-4. **Vault validates Entra JWT** tokens
+3. **Access tokens issued by Entra ID** (issuer: `https://sts.windows.net/{tenant-id}/`)
+4. **Vault validates Entra access tokens** via JWT auth method
 
 **This approach**:
 - ✅ No app registrations required (uses managed identity)
 - ✅ Uses Entra OAuth (not deprecated Azure DevOps OAuth)
-- ✅ JWT tokens from pipeline (not System.AccessToken)
+- ✅ Access tokens from pipeline via Azure CLI
 - ✅ Works with contributor permissions
 - ✅ Production-ready and Microsoft-recommended
 

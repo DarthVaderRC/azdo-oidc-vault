@@ -115,30 +115,31 @@ pool:
 
 variables:
   VAULT_ADDR: 'https://your-cluster.hashicorp.cloud:8200'
-  VAULT_NAMESPACE: 'admin/azdo-poc'
+  VAULT_NAMESPACE: 'admin'
   APP_NAME: 'app1'
 
 steps:
-  - task: Bash@3
-    displayName: 'Install Vault'
+  - task: AzureCLI@2
+    displayName: 'Get Access Token & Retrieve Secrets for App1'
     inputs:
-      targetType: 'inline'
-      script: |
-        VAULT_VERSION="1.15.0"
-        curl -Lo vault.zip "https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip"
-        unzip vault.zip && sudo mv vault /usr/local/bin/
-
-  - task: Bash@3
-    displayName: 'Retrieve Secrets for App1'
-    inputs:
-      targetType: 'inline'
-      script: |
-        export VAULT_ADDR="$(VAULT_ADDR)"
-        export VAULT_NAMESPACE="$(VAULT_NAMESPACE)"
-        export VAULT_TOKEN="$(VAULT_POC_TOKEN)"
+      azureSubscription: 'vault-managed-identity'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        ACCESS_TOKEN=$(az account get-access-token \
+          --resource https://management.core.windows.net/ \
+          --query accessToken -o tsv)
+        
+        VAULT_TOKEN=$(curl --silent --request POST \
+          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
+          --data "{\"jwt\": \"${ACCESS_TOKEN}\", \"role\": \"dev-mi-role\"}" \
+          $(VAULT_ADDR)/v1/auth/jwt/login | jq -r '.auth.client_token')
         
         echo "App: $(APP_NAME)"
-        vault kv get secret/dev/app-config
+        curl --silent \
+          --header "X-Vault-Token: ${VAULT_TOKEN}" \
+          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
+          $(VAULT_ADDR)/v1/secret/data/dev/app-config | jq
 ```
 
 #### Pipeline 2: `pipeline-app2.yml`
@@ -152,30 +153,31 @@ pool:
 
 variables:
   VAULT_ADDR: 'https://your-cluster.hashicorp.cloud:8200'
-  VAULT_NAMESPACE: 'admin/azdo-poc'
+  VAULT_NAMESPACE: 'admin'
   APP_NAME: 'app2'
 
 steps:
-  - task: Bash@3
-    displayName: 'Install Vault'
+  - task: AzureCLI@2
+    displayName: 'Get Access Token & Retrieve Secrets for App2'
     inputs:
-      targetType: 'inline'
-      script: |
-        VAULT_VERSION="1.15.0"
-        curl -Lo vault.zip "https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip"
-        unzip vault.zip && sudo mv vault /usr/local/bin/
-
-  - task: Bash@3
-    displayName: 'Retrieve Secrets for App2'
-    inputs:
-      targetType: 'inline'
-      script: |
-        export VAULT_ADDR="$(VAULT_ADDR)"
-        export VAULT_NAMESPACE="$(VAULT_NAMESPACE)"
-        export VAULT_TOKEN="$(VAULT_POC_TOKEN)"
+      azureSubscription: 'vault-managed-identity'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        ACCESS_TOKEN=$(az account get-access-token \
+          --resource https://management.core.windows.net/ \
+          --query accessToken -o tsv)
+        
+        VAULT_TOKEN=$(curl --silent --request POST \
+          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
+          --data "{\"jwt\": \"${ACCESS_TOKEN}\", \"role\": \"dev-mi-role\"}" \
+          $(VAULT_ADDR)/v1/auth/jwt/login | jq -r '.auth.client_token')
         
         echo "App: $(APP_NAME)"
-        vault kv get secret/dev/app-config
+        curl --silent \
+          --header "X-Vault-Token: ${VAULT_TOKEN}" \
+          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
+          $(VAULT_ADDR)/v1/secret/data/dev/app-config | jq
 ```
 
 #### Pipeline 3: `pipeline-app3.yml`
@@ -189,30 +191,31 @@ pool:
 
 variables:
   VAULT_ADDR: 'https://your-cluster.hashicorp.cloud:8200'
-  VAULT_NAMESPACE: 'admin/azdo-poc'
+  VAULT_NAMESPACE: 'admin'
   APP_NAME: 'app3'
 
 steps:
-  - task: Bash@3
-    displayName: 'Install Vault'
+  - task: AzureCLI@2
+    displayName: 'Get Access Token & Retrieve Secrets for App3'
     inputs:
-      targetType: 'inline'
-      script: |
-        VAULT_VERSION="1.15.0"
-        curl -Lo vault.zip "https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip"
-        unzip vault.zip && sudo mv vault /usr/local/bin/
-
-  - task: Bash@3
-    displayName: 'Retrieve Secrets for App3'
-    inputs:
-      targetType: 'inline'
-      script: |
-        export VAULT_ADDR="$(VAULT_ADDR)"
-        export VAULT_NAMESPACE="$(VAULT_NAMESPACE)"
-        export VAULT_TOKEN="$(VAULT_POC_TOKEN)"
+      azureSubscription: 'vault-managed-identity'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        ACCESS_TOKEN=$(az account get-access-token \
+          --resource https://management.core.windows.net/ \
+          --query accessToken -o tsv)
+        
+        VAULT_TOKEN=$(curl --silent --request POST \
+          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
+          --data "{\"jwt\": \"${ACCESS_TOKEN}\", \"role\": \"dev-mi-role\"}" \
+          $(VAULT_ADDR)/v1/auth/jwt/login | jq -r '.auth.client_token')
         
         echo "App: $(APP_NAME)"
-        vault kv get secret/dev/app-config
+        curl --silent \
+          --header "X-Vault-Token: ${VAULT_TOKEN}" \
+          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
+          $(VAULT_ADDR)/v1/secret/data/dev/app-config | jq
 ```
 
 ### Expected Result
@@ -350,50 +353,71 @@ Cost Analysis:
 
 ## 4.6 Test Different Bound Claims Strategies
 
-### Test A: By Project
+### Test A: By Managed Identity (Recommended)
 
 ```bash
-# Create role bound to specific project
-vault write auth/oidc/role/project-a-pipelines \
-  bound_audiences="api://AzureADTokenExchange" \
-  user_claim="sub" \
-  token_policies="dev-secrets-reader" \
-  bound_claims='{
-    "project": "project-a"
-  }'
+# Create role bound to specific managed identity
+curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
+     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+     --request POST \
+     --data "{
+       \"role_type\": \"jwt\",
+       \"bound_audiences\": [\"https://management.core.windows.net/\"],
+       \"user_claim\": \"sub\",
+       \"token_policies\": [\"dev-secrets-reader\"],
+       \"bound_claims\": {
+         \"sub\": \"${DEV_MI_PRINCIPAL_ID}\",
+         \"appid\": \"${DEV_MI_CLIENT_ID}\",
+         \"tid\": \"${AZURE_TENANT_ID}\"
+       }
+     }" \
+     ${VAULT_ADDR}/v1/auth/jwt/role/dev-mi-role
 
-# Result: All pipelines in "project-a" share 1 entity
+# Result: All pipelines using this managed identity share 1 entity
 ```
 
-### Test B: By Environment
+### Test B: By Tenant
 
 ```bash
-# Create role bound to environment
-vault write auth/oidc/role/dev-environment \
-  bound_audiences="api://AzureADTokenExchange" \
-  user_claim="sub" \
-  token_policies="dev-secrets-reader" \
-  bound_claims='{
-    "environment": "development"
-  }'
+# Create role bound to tenant (less restrictive)
+curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
+     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+     --request POST \
+     --data "{
+       \"role_type\": \"jwt\",
+       \"bound_audiences\": [\"https://management.core.windows.net/\"],
+       \"user_claim\": \"sub\",
+       \"token_policies\": [\"dev-secrets-reader\"],
+       \"bound_claims\": {
+         \"tid\": \"${AZURE_TENANT_ID}\"
+       }
+     }" \
+     ${VAULT_ADDR}/v1/auth/jwt/role/tenant-role
 
-# Result: All pipelines deploying to "dev" share 1 entity
+# Result: All managed identities in this tenant can authenticate
 ```
 
-### Test C: Combination
+### Test C: Combination (MI + Tenant)
 
 ```bash
 # Create role with multiple bound claims
-vault write auth/oidc/role/project-a-prod \
-  bound_audiences="api://AzureADTokenExchange" \
-  user_claim="sub" \
-  token_policies="prod-secrets-reader" \
-  bound_claims='{
-    "project": "project-a",
-    "environment": "production"
-  }'
+curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
+     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+     --request POST \
+     --data "{
+       \"role_type\": \"jwt\",
+       \"bound_audiences\": [\"https://management.core.windows.net/\"],
+       \"user_claim\": \"sub\",
+       \"token_policies\": [\"prod-secrets-reader\"],
+       \"bound_claims\": {
+         \"sub\": \"${PROD_MI_PRINCIPAL_ID}\",
+         \"appid\": \"${PROD_MI_CLIENT_ID}\",
+         \"tid\": \"${AZURE_TENANT_ID}\"
+       }
+     }" \
+     ${VAULT_ADDR}/v1/auth/jwt/role/prod-mi-role
 
-# Result: Only pipelines in "project-a" deploying to "prod" share this entity
+# Result: Only pipelines using this specific prod managed identity can authenticate
 ```
 
 ## 4.7 Performance Testing
@@ -415,10 +439,10 @@ echo "Running ${ITERATIONS} authentication attempts..."
 for i in $(seq 1 $ITERATIONS); do
   START=$(date +%s.%N)
   
-  # Simulate OIDC authentication
-  vault write -field=token auth/oidc/login \
-    role="azdo-pipelines" \
-    jwt="${JWT_TOKEN}" > /dev/null 2>&1
+  # Simulate JWT authentication via curl
+  curl --silent --request POST \
+    --data "{\"jwt\": \"${JWT_TOKEN}\", \"role\": \"dev-mi-role\"}" \
+    ${VAULT_ADDR}/v1/auth/jwt/login > /dev/null 2>&1
   
   if [ $? -eq 0 ]; then
     SUCCESS=$((SUCCESS + 1))
@@ -456,7 +480,7 @@ vault audit enable file file_path=/vault/logs/audit.log
 vault audit list
 
 # Review authentication patterns
-# Look for: auth/oidc/login events
+# Look for: auth/jwt/login events
 # Analyze: entity_id, aliases, policies assigned
 ```
 

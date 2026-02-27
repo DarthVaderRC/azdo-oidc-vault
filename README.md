@@ -1,211 +1,160 @@
 # Azure DevOps OIDC + HCP Vault POC
 
-## 🎯 Overview
+A comprehensive POC guide for implementing Azure DevOps OIDC authentication with HCP Vault — eliminating stored credentials, reducing client counts, and centralising secret management.
 
-This POC demonstrates how to **reduce Vault client count by 85-95%** using Azure DevOps with **Entra ID JWT authentication** (managed identity, no app registration) instead of service principals.
+## Key Approach
 
-**Problem**: 400+ service principals = 400+ Vault clients = High HCP Vault costs  
-**Solution**: JWT auth with bound claims = 10-20 entities = **$1,800+/year savings**
-
-### ✅ Correct Approach (Updated)
-
-**Important**: This documentation uses the **correct production-ready approach**:
-
-1. ✅ **JWT Auth** (NOT OIDC with `oidc_client_id`) - See [CORRECTED_APPROACH.md](CORRECTED_APPROACH.md)
-2. ✅ **Managed Identity** (no app registration needed - works with contributor permissions)
-3. ✅ **Entra ID OAuth** (Microsoft is sunsetting Azure DevOps OAuth)
-4. ✅ **JWT tokens from pipeline** (NOT System.AccessToken or AppRole)
-5. ✅ **curl commands only** (no Vault CLI binary required)
-
-**Read [CORRECTED_APPROACH.md](CORRECTED_APPROACH.md) first** to understand the critical fixes!
-
-## 🚀 Quick Start
-
-**Want to get started immediately?** → **Read [GET_STARTED.md](GET_STARTED.md) then follow [STEP_1](STEP_1_AZURE_SETUP.md) through [STEP_5](STEP_5_PRODUCTION.md)**
-
-**Key Approach**:
-- ✅ Uses **Managed Identity** (no app registration needed - works with contributor permissions)
-- ✅ **Entra ID JWT tokens** (Microsoft is sunsetting Azure DevOps OAuth)
+- ✅ Uses **Managed Identity** (no app registration needed — works with contributor permissions)
+- ✅ **Access tokens** from Azure CLI (authorisation-ready tokens with MI claims)
 - ✅ **curl commands only** (no Vault CLI binary required)
-- ✅ **JWT auth** with `oidc_discovery_url` (correct Vault configuration)
+- ✅ **JWT auth** with exact claim matching (oid, appid, tid)
+- ✅ **Managed-identity-level** granularity (matches Azure auth method)
 - ✅ Production-ready implementation
 
-## 📋 Table of Contents
-
-1. [Executive Summary](EXECUTIVE_SUMMARY.md) - Business case and feasibility assessment
-2. [Get Started](GET_STARTED.md) - Implementation roadmap
-3. [Step-by-Step Guides](#step-by-step-implementation)
-4. [Common Pitfalls](COMMON_PITFALLS.md) - Troubleshooting guide
-5. [Sample Code](SAMPLES.md) - Reusable templates and scripts
-
-## 📐 Architecture
+## Architecture
 
 ```
-Azure DevOps Pipeline (JWT Token)
-    ↓
-OIDC Auth Method (HCP Vault)
-    ↓
-Bound Claims Validation
-    ↓
-Entity/Alias Creation
-    ↓
-Policy Assignment
-    ↓
-KV Secrets Access
+┌─────────────────────────────────────────────────────────────┐
+│ Azure DevOps Pipeline                                       │
+│  - Obtains access token from Azure Entra ID via Azure CLI   │
+│  - Token contains claims: oid, appid, sub, tid              │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│ HCP Vault - JWT Auth Method                                 │
+│  - Validates JWT signature against Entra ID JWKS            │
+│  - Matches bound_claims (sub, appid, tid)                   │
+│  - Returns Vault token with policies                        │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Entity/Alias Management                                     │
+│  - Multiple pipelines → Same entity (via user_claim: sub)   │
+│  - bound_claims control auth success                        │
+│  - claim_mappings export oid, appid, tid as metadata        │
+│  - 1 entity per managed identity = 1 client (licensing)     │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│ KV Secrets Engine                                           │
+│  - Read secrets based on policy                             │
+│  - Short-lived tokens (30-60 min)                           │
+│  - No stored credentials in Azure DevOps                    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## ✅ Prerequisites
+## Prerequisites
 
-- [x] Azure subscription (available)
-- [x] HCP Vault Dedicated cluster (can spin up)
-- [ ] Azure DevOps organization
+- [ ] Azure subscription with Contributor permissions
+- [ ] HCP Vault Dedicated cluster
+- [ ] Azure DevOps organisation with a project
 - [ ] Azure CLI installed locally
-- [ ] Vault CLI installed locally
 - [ ] Git repository for pipeline code
 
-## 💡 Client Count Reduction Strategy
-
-### Current: Service Principal Approach
-```
-Service Principal 1 → Vault Entity 1 (Client 1)
-Service Principal 2 → Vault Entity 2 (Client 2)
-...
-Service Principal 400 → Vault Entity 400 (Client 400)
-```
-
-### Target: OIDC with Bound Claims
-```
-OIDC Auth Method
-├── Role: dev-pipelines (bound to project:dev)
-│   ├── Pipeline 1 → Entity A (shared)
-│   ├── Pipeline 2 → Entity A (shared)
-│   └── Pipeline N → Entity A (shared)
-├── Role: prod-pipelines (bound to project:prod)
-│   ├── Pipeline X → Entity B (shared)
-│   └── Pipeline Y → Entity B (shared)
-└── Role: infra-pipelines (bound to project:infra)
-    └── Pipeline Z → Entity C (shared)
-```
-
-**Result**: 400 pipelines → 3-15 entities = **85-97.5% reduction**
-
-## 📚 Step-by-Step Implementation
+## Step-by-Step Implementation
 
 | Step | Document | Time | Description |
 |------|----------|------|-------------|
-| 1 | [Azure DevOps Setup](STEP_1_AZURE_SETUP.md) | 20 min | Configure AZDO organization and OIDC |
-| 2 | [HCP Vault Configuration](STEP_2_VAULT_SETUP.md) | 30 min | Enable OIDC auth, create roles & policies |
-| 3 | [Pipeline Integration](STEP_3_PIPELINE_INTEGRATION.md) | 45 min | Update pipelines to use Vault |
+| 1 | [Azure DevOps Setup](STEP_1_AZURE_SETUP.md) | 20 min | Configure Azure DevOps organisation and OIDC |
+| 2 | [HCP Vault Configuration](STEP_2_VAULT_SETUP.md) | 30 min | Enable JWT auth, create roles & policies |
+| 3 | [Pipeline Integration](STEP_3_PIPELINE_INTEGRATION.md) | 45 min | Update pipelines to authenticate with Vault |
 | 4 | [Testing & Validation](STEP_4_TESTING.md) | 30 min | Verify client count reduction |
 | 5 | [Production Deployment](STEP_5_PRODUCTION.md) | 1 hour | Best practices and rollout strategy |
 
-**Total Time**: ~3 hours for complete POC
+**Supporting resources:**
+- [DIAGRAMS.md](DIAGRAMS.md) — Visual architecture and flow diagrams
+- [COMMON_PITFALLS.md](COMMON_PITFALLS.md) — Troubleshooting guide
 
-## 💰 Cost Comparison
+## Why OIDC over Other Approaches
 
-| Approach | Vault Clients | Monthly Cost | Annual Cost | Savings |
-|----------|---------------|--------------|-------------|---------|
-| **Service Principals** | 400 | $160 | $1,920 | Baseline |
-| **OIDC (Conservative)** | 50 | $20 | $240 | $1,680/year |
-| **OIDC (Optimized)** | 20 | $8 | $96 | $1,824/year |
-| **OIDC (Aggressive)** | 10 | $4 | $48 | $1,872/year |
+| Aspect | Service Principals | Azure Auth | AppRole | OIDC/JWT (This Guide) |
+|--------|-------------------|------------|---------|-------------------|
+| **Credentials** | Long-lived, stored | Managed identity | Secret ID required | Short-lived, auto-generated (JWT) |
+| **Rotation** | Manual, complex | Automatic | Manual | Automatic |
+| **Client Count** | 1 per pipeline | 1 per identity | 1 per app | Shared via bound claims |
+| **Infrastructure** | None extra | Requires Azure VMs/RGs | None extra | None extra |
+| **Multi-cloud** | Azure only | Azure only | Cloud-agnostic | Cloud-agnostic |
+| **Security Risk** | Credential exposure | Low | Secret exposure | Minimal |
 
-*Based on $0.40/client/month for HCP Vault*
+## Bound Claims Strategy
 
-## 🎁 What's Included
+`bound_claims` control authorisation (which pipelines can authenticate), while `user_claim` determines entity consolidation and client licensing.
+
+**Recommended: Managed Identity Consolidation**
+```hcl
+role_type       = "jwt"
+user_claim      = "sub"   # MI principal ID → 1 entity per managed identity
+bound_audiences = ["https://management.core.windows.net/"]
+bound_claims = {
+  sub   = var.managed_identity_principal_id
+  appid = var.managed_identity_client_id
+  tid   = var.azure_tenant_id
+}
+claim_mappings = {
+  oid   = "managed_identity_oid"
+  appid = "managed_identity_client_id"
+  tid   = "tenant_id"
+}
+# Result: All pipelines using this MI share 1 entity
+# Multiple roles can target different MIs for environment isolation
+```
+
+**Multiple Roles for Environment Isolation:**
+```hcl
+# Dev role — read-only, bound to dev managed identity
+bound_claims = {
+  sub   = var.dev_mi_principal_id
+  appid = var.dev_mi_client_id
+  tid   = var.azure_tenant_id
+}
+token_policies = ["dev-read-only"]
+
+# Prod role — read/write, bound to prod managed identity
+bound_claims = {
+  sub   = var.prod_mi_principal_id
+  appid = var.prod_mi_client_id
+  tid   = var.azure_tenant_id
+}
+token_policies = ["prod-read-write"]
+# Result: 2 entities total (1 per managed identity), different policies per role
+```
+
+## Key Benefits
+
+**Security** — Zero stored credentials, automatic token expiration (30-60 min), centralised access control, full audit trail with JWT claims logged as entity metadata.
+
+**Cost** — 98% client count reduction (400 pipelines → 4-8 managed identities), ~$1,800+/year savings, scales without increasing client count.
+
+**Operations** — Single auth method, no credential rotation, easy pipeline onboarding, simplified troubleshooting.
+
+## Repository Structure
 
 ```
 azdo-oidc-vault/
-├── README.md                          # This file - START HERE
-├── CORRECTED_APPROACH.md              # CRITICAL - Read this first!
-├── GET_STARTED.md                     # Implementation roadmap
-├── INDEX.md                           # Navigation guide
-├── EXECUTIVE_SUMMARY.md               # Business case and ROI
-├── DIAGRAMS.md                        # Visual architecture
-├── STEP_1_AZURE_SETUP.md             # Azure DevOps + Managed Identity
-├── STEP_2_VAULT_SETUP.md             # HCP Vault + JWT auth (curl)
-├── STEP_3_PIPELINE_INTEGRATION.md    # Pipeline with Entra JWT
-├── STEP_4_TESTING.md                 # Validation procedures
-├── STEP_5_PRODUCTION.md              # Production best practices
-├── COMMON_PITFALLS.md                # Troubleshooting guide
-├── SAMPLES.md                         # Code templates documentation
-└── samples/
-    ├── pipelines/                     # Azure DevOps pipeline templates
-    │   └── basic-vault-integration.yml  # Working example (curl-based)
-    ├── scripts/                       # (deprecated - using curl now)
-    └── terraform/                     # Terraform for Vault config
+├── README.md                             # This file
+├── DIAGRAMS.md                           # Visual architecture diagrams
+├── STEP_1_AZURE_SETUP.md                 # Azure DevOps configuration
+├── STEP_2_VAULT_SETUP.md                 # HCP Vault setup & JWT auth
+├── STEP_3_PIPELINE_INTEGRATION.md        # Pipeline code updates
+├── STEP_4_TESTING.md                     # Validation & client count checks
+├── STEP_5_PRODUCTION.md                  # Best practices & rollout
+└── COMMON_PITFALLS.md                    # Troubleshooting guide
 ```
 
-## ✨ Key Benefits
+## Success Criteria
 
-### 🔒 Security
-- ✅ No long-lived credentials
-- ✅ Automatic token expiration (30-60 min)
-- ✅ Centralized access control
-- ✅ Full audit trail
-
-### 💸 Cost
-- ✅ 85-95% client count reduction
-- ✅ $1,800+/year savings
-- ✅ Scales with growth
-
-### ⚙️ Operations
-- ✅ Single auth method
-- ✅ No credential management
-- ✅ Easy pipeline onboarding
-- ✅ Simplified troubleshooting
-
-## 🎯 Success Criteria
-
-- [ ] OIDC authentication working
-- [ ] Secrets retrieved in pipeline
-- [ ] Client count reduced by 85%+
+- [ ] JWT authentication working with access tokens
+- [ ] Secrets retrieved in pipeline via curl
 - [ ] Authentication time < 3 seconds
 - [ ] 99%+ success rate
+- [ ] Client count reduced to 4-8 entities
 
-## 📊 Recommended Path
+## Getting Help
 
-### Start Here (Required Reading - 15 minutes)
-1. **[CORRECTED_APPROACH.md](CORRECTED_APPROACH.md)** - Understand the critical fixes
-2. **[GET_STARTED.md](GET_STARTED.md)** - Implementation roadmap
-
-### For Production Implementation (4-6 hours)
-1. [EXECUTIVE_SUMMARY.md](EXECUTIVE_SUMMARY.md) (get buy-in)
-2. [STEP_1_AZURE_SETUP.md](STEP_1_AZURE_SETUP.md) → [STEP_5_PRODUCTION.md](STEP_5_PRODUCTION.md) (detailed implementation)
-3. [samples/pipelines/basic-vault-integration.yml](samples/pipelines/basic-vault-integration.yml) (working example)
-4. [COMMON_PITFALLS.md](COMMON_PITFALLS.md) (reference during rollout)
-
-## 🆘 Troubleshooting
-
-Having issues? Check [COMMON_PITFALLS.md](COMMON_PITFALLS.md) for solutions to:
-- OIDC token access in Azure DevOps
-- Bound claims not matching
-- Client count not reducing
-- Token expiration issues
-- And more...
-
-## 📞 Support
-
-- **HashiCorp Learn**: https://learn.hashicorp.com/vault
-- **Community Forum**: https://discuss.hashicorp.com
-- **HCP Support**: For HCP Vault Dedicated customers
-- **Azure DevOps Docs**: https://learn.microsoft.com/azure/devops
-
-## 🎓 Additional Resources
-
-- [Vault OIDC Auth Method](https://developer.hashicorp.com/vault/docs/auth/jwt)
-- [Azure DevOps Workload Identity](https://learn.microsoft.com/en-us/azure/devops/pipelines/library/connect-to-azure)
-- [HCP Vault Client Count](https://developer.hashicorp.com/vault/tutorials/monitoring/usage-metrics)
-
-## 🤝 Contributing
-
-This POC is designed to be customized for your specific environment. Feel free to adapt the templates and scripts to match your organization's requirements.
-
----
-
-**Ready to start?** → **[Jump to Quick Start](QUICKSTART.md)** 🚀
-
-**Document Version**: 1.0  
-**Last Updated**: November 2025  
-**Status**: Ready for Implementation
-
+1. Check [COMMON_PITFALLS.md](COMMON_PITFALLS.md) for troubleshooting
+2. Review the relevant STEP_X guide for section-specific issues
+3. HashiCorp Community: https://discuss.hashicorp.com
+4. HCP Vault Support: https://support.hashicorp.com (HCP customers)

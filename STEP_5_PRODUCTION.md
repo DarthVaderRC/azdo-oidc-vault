@@ -29,43 +29,42 @@ Level 3: By Application Type
 
 ## 5.2 Bound Claims Implementation Guide
 
-### Strategy 1: Project-Based (Simplest)
+### Strategy 1: Tenant-Based (Simplest)
 
 ```hcl
-# All pipelines in same tenant/subscription share entity
+# All managed identities in same tenant can authenticate
 resource "vault_jwt_auth_backend_role" "tenant_pipelines" {
   backend         = vault_auth_backend.jwt.path
   role_name       = "tenant-pipelines"
   token_policies  = ["dev-secrets-reader"]
   
   role_type       = "jwt"
-  bound_audiences = ["api://AzureADTokenExchange"]
+  bound_audiences = ["https://management.core.windows.net/"]
   user_claim      = "sub"
   
   bound_claims = {
-    iss = "https://login.microsoftonline.com/${var.azure_tenant_id}/v2.0"
+    tid = var.azure_tenant_id
   }
 }
 ```
 
-### Strategy 2: Environment-Based (Recommended)
+### Strategy 2: Per Managed Identity (Recommended)
 
 ```hcl
-# Separate roles per environment using service connection patterns
-# Note: Use sub glob patterns since managed identity doesn't support custom claims
+# Separate roles per managed identity for environment isolation
 resource "vault_jwt_auth_backend_role" "env_production" {
   backend         = vault_auth_backend.jwt.path
   role_name       = "env-production"
   token_policies  = ["prod-secrets-reader", "prod-secrets-writer"]
   
   role_type       = "jwt"
-  bound_audiences = ["api://AzureADTokenExchange"]
-  user_claim      = "iss"  # For entity consolidation
+  bound_audiences = ["https://management.core.windows.net/"]
+  user_claim      = "sub"
   
-  bound_claims_type = "glob"
   bound_claims = {
-    iss = "https://login.microsoftonline.com/${var.azure_tenant_id}/v2.0",
-    sub = "*/sc/${var.prod_service_connection_id}/*"  # Prod service connection
+    sub   = var.prod_mi_principal_id
+    appid = var.prod_mi_client_id
+    tid   = var.azure_tenant_id
   }
   
   token_ttl     = 1800  # 30 minutes
@@ -73,7 +72,7 @@ resource "vault_jwt_auth_backend_role" "env_production" {
 }
 ```
 
-### Strategy 3: By Managed Identity (Advanced)
+### Strategy 3: By Managed Identity with OID (Advanced)
 
 ```hcl
 # Use object ID (oid) claim from managed identity
@@ -84,12 +83,13 @@ resource "vault_jwt_auth_backend_role" "app_team_a" {
   token_policies  = ["team-a-secrets"]
   
   role_type       = "jwt"
-  bound_audiences = ["api://AzureADTokenExchange"]
+  bound_audiences = ["https://management.core.windows.net/"]
   user_claim      = "sub"
   
   bound_claims = {
-    iss = "https://login.microsoftonline.com/${var.azure_tenant_id}/v2.0",
-    oid = "<specific-managed-identity-object-id>"
+    sub   = var.team_a_mi_principal_id
+    appid = var.team_a_mi_client_id
+    tid   = var.azure_tenant_id
   }
 }
 ```
@@ -97,19 +97,19 @@ resource "vault_jwt_auth_backend_role" "app_team_a" {
 ### Strategy 4: Hybrid Approach (Best for Scale)
 
 ```hcl
-# Multiple tenants with wildcard issuer
+# Multi-tenant with wildcard issuer (note: different from single-tenant approach)
 resource "vault_jwt_auth_backend_role" "multi_tenant" {
   backend         = vault_auth_backend.jwt.path
   role_name       = "multi-tenant-pipelines"
   token_policies  = ["shared-secrets"]
   
   role_type       = "jwt"
-  bound_audiences = ["api://AzureADTokenExchange"]
+  bound_audiences = ["https://management.core.windows.net/"]
   user_claim      = "sub"
   
   bound_claims_type = "glob"
   bound_claims = {
-    iss = "https://login.microsoftonline.com/*/v2.0"  # Any tenant
+    iss = "https://sts.windows.net/*/",  # Any tenant (multi-tenant)
   }
   
   token_ttl         = 1800
@@ -146,7 +146,7 @@ resource "vault_jwt_auth_backend" "azdo" {
   type              = "jwt"
   
   oidc_discovery_url = "https://login.microsoftonline.com/${var.azure_tenant_id}/v2.0"
-  bound_issuer       = "https://login.microsoftonline.com/${var.azure_tenant_id}/v2.0"
+  bound_issuer       = "https://sts.windows.net/${var.azure_tenant_id}/"
   default_role       = "default-azdo"
   
   tune {
@@ -206,12 +206,13 @@ resource "vault_jwt_auth_backend_role" "dev_pipelines" {
   token_policies  = [vault_policy.dev_reader.name]
   
   role_type       = "jwt"
-  bound_audiences = ["api://AzureADTokenExchange"]
+  bound_audiences = ["https://management.core.windows.net/"]
   user_claim      = "sub"
   
-  bound_claims_type = "string"
   bound_claims = {
-    iss = "https://login.microsoftonline.com/${var.azure_tenant_id}/v2.0"
+    sub   = var.dev_mi_principal_id
+    appid = var.dev_mi_client_id
+    tid   = var.azure_tenant_id
   }
   
   token_ttl       = 3600
@@ -225,11 +226,13 @@ resource "vault_jwt_auth_backend_role" "prod_pipelines" {
   token_policies  = [vault_policy.prod_reader.name]
   
   role_type       = "jwt"
-  bound_audiences = ["api://AzureADTokenExchange"]
+  bound_audiences = ["https://management.core.windows.net/"]
   user_claim      = "sub"
   
   bound_claims = {
-    iss = "https://login.microsoftonline.com/${var.azure_tenant_id}/v2.0"
+    sub   = var.prod_mi_principal_id
+    appid = var.prod_mi_client_id
+    tid   = var.azure_tenant_id
   }
   
   token_ttl       = 1800
@@ -288,6 +291,26 @@ variable "azure_tenant_id" {
   description = "Azure Tenant ID for Entra ID OAuth"
   type        = string
 }
+
+variable "dev_mi_principal_id" {
+  description = "Dev managed identity principal (object) ID"
+  type        = string
+}
+
+variable "dev_mi_client_id" {
+  description = "Dev managed identity client (application) ID"
+  type        = string
+}
+
+variable "prod_mi_principal_id" {
+  description = "Prod managed identity principal (object) ID"
+  type        = string
+}
+
+variable "prod_mi_client_id" {
+  description = "Prod managed identity client (application) ID"
+  type        = string
+}
 ```
 
 File: `terraform/outputs.tf`
@@ -341,47 +364,41 @@ parameters:
     type: string
 
 steps:
-  - task: Bash@3
-    displayName: 'Install Vault CLI'
-    inputs:
-      targetType: 'inline'
-      script: |
-        if ! command -v vault &> /dev/null; then
-          VAULT_VERSION="1.15.0"
-          curl -Lo vault.zip "https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip"
-          unzip -o vault.zip
-          sudo mv vault /usr/local/bin/
-          rm vault.zip
-        fi
-        vault version
-
   - task: AzureCLI@2
-    displayName: 'Get Azure AD Token'
+    displayName: 'Get Access Token'
     inputs:
       azureSubscription: '$(azureServiceConnection)'
       scriptType: 'bash'
       scriptLocation: 'inlineScript'
-      addSpnToEnvironment: true
       inlineScript: |
-        # Get Azure AD token for Vault
+        # Get access token with Azure Resource Manager audience
         TOKEN=$(az account get-access-token \
-          --resource $(vaultAppId) \
+          --resource https://management.core.windows.net/ \
           --query accessToken -o tsv)
         
-        echo "##vso[task.setvariable variable=AZURE_TOKEN;issecret=true]${TOKEN}"
+        echo "##vso[task.setvariable variable=ACCESS_TOKEN;issecret=true]${TOKEN}"
 
   - task: Bash@3
     displayName: 'Authenticate to Vault'
     env:
       VAULT_ADDR: ${{ parameters.vaultAddr }}
       VAULT_NAMESPACE: ${{ parameters.vaultNamespace }}
-      AZURE_TOKEN: $(AZURE_TOKEN)
+      ACCESS_TOKEN: $(ACCESS_TOKEN)
     inputs:
       targetType: 'inline'
       script: |
-        VAULT_TOKEN=$(vault write -field=token auth/oidc/login \
-          role="${{ parameters.oidcRole }}" \
-          jwt="${AZURE_TOKEN}")
+        AUTH_RESPONSE=$(curl --silent --request POST \
+          --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+          --data "{\"jwt\": \"${ACCESS_TOKEN}\", \"role\": \"${{ parameters.oidcRole }}\"}" \
+          ${VAULT_ADDR}/v1/auth/jwt/login)
+        
+        VAULT_TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.auth.client_token')
+        
+        if [ -z "$VAULT_TOKEN" ] || [ "$VAULT_TOKEN" = "null" ]; then
+          echo "Error: Failed to authenticate to Vault"
+          echo "Response: $AUTH_RESPONSE"
+          exit 1
+        fi
         
         echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true;isOutput=true]${VAULT_TOKEN}"
 
@@ -394,9 +411,14 @@ steps:
     inputs:
       targetType: 'inline'
       script: |
-        # Read secrets
-        vault kv get -format=json ${{ parameters.secretPath }} | \
-          jq -r '.data.data | to_entries[] | "##vso[task.setvariable variable=\(.key);issecret=true]\(.value)"'
+        # Read secrets using curl
+        SECRET_DATA=$(curl --silent \
+          --header "X-Vault-Token: ${VAULT_TOKEN}" \
+          --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+          ${VAULT_ADDR}/v1/${{ parameters.secretPath }})
+        
+        # Export each key as a masked pipeline variable
+        echo "$SECRET_DATA" | jq -r '.data.data | to_entries[] | "##vso[task.setvariable variable=\(.key);issecret=true]\(.value)"'
 ```
 
 Use the template in pipelines:
@@ -591,8 +613,8 @@ curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
 echo "${JWT_TOKEN}" | cut -d'.' -f2 | base64 -d | jq
 
 # Check if issuer matches
-# JWT iss claim should match bound_claims.iss in role
-# Expected: https://login.microsoftonline.com/<tenant-id>/v2.0
+# JWT iss claim should match bound_issuer in JWT config
+# Expected for access tokens: https://sts.windows.net/<tenant-id>/
 ```
 
 ### Issue 2: Client Count Not Reducing
@@ -617,7 +639,7 @@ curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
 
 # Expected: Multiple aliases per entity
 # If each pipeline creates new entity, bound_claims aren't matching
-# Verify JWT issuer matches: https://login.microsoftonline.com/<tenant-id>/v2.0
+# Verify JWT issuer: https://sts.windows.net/<tenant-id>/
 ```
 
 ### Issue 3: Permission Denied

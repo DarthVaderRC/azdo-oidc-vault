@@ -1,0 +1,115 @@
+trigger:
+- none
+pool:
+  vmImage: ubuntu-latest
+variables:
+  # 1. Your HCP Vault Dedicated address
+  VAULT_ADDR: 'https://vault-poc-cluster-public-vault-XXXXXXXX.XXXXXXXX.z1.hashicorp.cloud:8200'
+  # 2. The namespace you created
+  VAULT_NAMESPACE: 'admin'
+  # 3. The name of the Service Connection created in Step 1
+  AZDO_SVC_CONN: 'Vault-OIDC-Federation-WIF-test' 
+  # 4. The Vault OIDC Role name created in Step 6
+  VAULT_ROLE: 'azdo-project-role3' 
+  
+  # Set up a secret variable for the token (for later use)
+  vaultToken: ''
+stages:
+- stage: RetrieveSecrets
+  displayName: 'Retrieve Secret using OIDC via Script'
+  jobs:
+  - job: SecretRetrievalJob
+    steps:
+    
+    # ----------------------------------------------------
+    # STEP 1: Execute Azure CLI Task to get the OIDC Token
+    # This task is critical. By referencing the AZDO Service Connection, 
+    # it causes AZDO to inject the OIDC token (JWT) into the environment.
+    # We will use an obscure Azure CLI command to trigger the token flow 
+    # without doing any actual Azure work, just to capture the JWT.
+    # ----------------------------------------------------
+    - task: AzureCLI@2
+      displayName: 'Trigger OIDC Token Generation'
+      inputs:
+        azureSubscription: '$(AZDO_SVC_CONN)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        # CRITICAL: This enables the $idToken variable
+        addSpnToEnvironment: true
+        # The AZDO runner environment variable that holds the JWT
+        inlineScript: |
+          TOKEN=$(az account get-access-token --query accessToken -o tsv) # obtain Entra ID access token.
+          
+          # Decode the payload (the second part of the JWT)
+          # This will output the JSON claims so you can see the "iss" value
+          echo "Decoding Token Payload:"
+          echo $TOKEN | cut -d. -f2 | base64 --decode | jq .
+          if [ -z "$TOKEN" ]; then
+            echo "##vso[task.logissue type=error]TOKEN not found."
+            exit 1
+          fi
+          echo "AZDO Federated JWT token successfully obtained."
+          echo "AZURE_FEDERATED_TOKEN is: $TOKEN"
+          
+          # Pass the OIDC token as an environment variable for the next step
+          echo "##vso[task.setvariable variable=OIDC_TOKEN;isSecret=true]$TOKEN"
+          
+    # ----------------------------------------------------
+    # STEP 2: Authenticate to Vault using Curl and the OIDC Token
+    # Use the captured OIDC_TOKEN (JWT) to log in to Vault.
+    # ----------------------------------------------------
+    - script: |
+        VAULT_ADDR_VAR="$VAULT_ADDR"
+        VAULT_NAMESPACE_VAR="$VAULT_NAMESPACE"
+        VAULT_ROLE_VAR="$VAULT_ROLE"
+        JWT=$OIDC_TOKEN # Accessing the secret variable from previous step
+        
+        echo "Attempting OIDC login to Vault at $VAULT_ADDR_VAR in namespace $VAULT_NAMESPACE_VAR with OIDC_TOKEN: $JWT ..."
+        # Curl command to hit the JWT login endpoint
+        VAULT_RESPONSE=$(curl -s --request POST "$VAULT_ADDR_VAR/v1/auth/jwt/login" --header "X-Vault-Namespace: $VAULT_NAMESPACE_VAR" --data "{\"role\":\"$VAULT_ROLE_VAR\", \"jwt\":\"$JWT\"}" | jq)
+          #--header "X-Vault-Namespace: $VAULT_NAMESPACE_VAR"
+        echo "AUTH RESPOSE: $VAULT_RESPONSE"
+        # Extract the Vault client token using jq (standard tool on agents)
+        VAULT_CLIENT_TOKEN=$(echo "$VAULT_RESPONSE" | jq -r '.auth.client_token')
+        if [ "$VAULT_CLIENT_TOKEN" = "null" ] || [ -z "$VAULT_CLIENT_TOKEN" ]; then
+            echo "##vso[task.logissue type=error]Vault login failed. Response: $VAULT_RESPONSE"
+            exit 1
+        fi
+        echo "Vault login successful! Setting token variable."
+        
+        # Set the retrieved Vault token as a secret variable for the next step
+        echo "##vso[task.setvariable variable=vaultToken;isSecret=true]$VAULT_CLIENT_TOKEN"
+      displayName: 'Vault OIDC Login via Curl'
+      env:
+        # Pass the secret OIDC token to the script environment
+        OIDC_TOKEN: $(OIDC_TOKEN)
+    # ----------------------------------------------------
+    # STEP 3: Retrieve the Secret using the Vault Token
+    # Use the Vault token from the previous step to read the KV secret.
+    # ----------------------------------------------------
+    - script: |
+        VAULT_ADDR_VAR="$(VAULT_ADDR)"
+        VAULT_NAMESPACE_VAR="$(VAULT_NAMESPACE)"
+        TOKEN="$vaultToken"
+        
+        echo "Retrieving secret secret/sample-secret..."
+        # Curl command to read the secret using the retrieved client token
+        SECRET_RESPONSE=$(curl -s --request GET "$VAULT_ADDR_VAR/v1/secret/data/sample-secret" --header "X-Vault-Token: $TOKEN" --header "X-Vault-Namespace: $VAULT_NAMESPACE_VAR" | jq)
+        # Extract the 'my_key' value
+        echo "SECRET_RESPONSE: $SECRET_RESPONSE"
+        SECRET_VALUE=$(echo "$SECRET_RESPONSE" | jq -r '.data.data["first-secret"]')
+        
+        if [ "$SECRET_VALUE" = "null" ] || [ -z "$SECRET_VALUE" ]; then
+            echo "##vso[task.logissue type=error]Secret retrieval failed. Response: $SECRET_RESPONSE"
+            exit 1
+        fi
+        
+        echo "Successfully retrieved secret value (masked): $SECRET_VALUE"
+        
+        # Output the value masked by AZDO for security
+        echo "##vso[task.setvariable variable=SECRET_FROM_VAULT;isSecret=true]$SECRET_VALUE"
+        echo "Secret from Vault: $SECRET_FROM_VAULT"
+      displayName: 'Retrieve KV Secret via Curl'
+      env:
+        # Pass the secret Vault token to the script environment
+        vaultToken: $(vaultToken)

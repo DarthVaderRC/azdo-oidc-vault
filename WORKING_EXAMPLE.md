@@ -3,8 +3,8 @@
 ### Step 1: Create Service Connection
 
 In Azure DevOps:
-1. Project Settings \u2192 Service Connections
-2. New Service Connection \u2192 Azure Resource Manager
+1. Project Settings Service Connections
+2. New Service Connection Azure Resource Manager
 3. Workload Identity Federation (automatic)
 4. Select subscription
 5. Name: `vault-managed-identity`
@@ -135,7 +135,7 @@ steps:
           exit 1
         fi
         
-        echo "\u2713 Authenticated to Vault!"
+        echo "Authenticated to Vault!"
         echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true]${VAULT_TOKEN}"
 
   - task: Bash@3
@@ -156,7 +156,7 @@ steps:
         DATABASE_URL=$(echo "$SECRET_DATA" | jq -r '.data.data.database_url')
         API_KEY=$(echo "$SECRET_DATA" | jq -r '.data.data.api_key')
         
-        echo "\u2713 Secrets retrieved!"
+        echo "Secrets retrieved!"
         echo "##vso[task.setvariable variable=DATABASE_URL;issecret=true]${DATABASE_URL}"
         echo "##vso[task.setvariable variable=API_KEY;issecret=true]${API_KEY}"
 
@@ -170,12 +170,12 @@ steps:
       script: |
         echo "Deploying with secrets..."
         echo "Database: ${DATABASE_URL:0:20}..."
-        echo "\u2713 Deployed!"
+        echo "Deployed!"
 ```
 
 ---
 
-## \u2705 Verification Checklist
+## erification Checklist
 
 After implementation, verify:
 

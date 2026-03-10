@@ -126,8 +126,6 @@ token_policies = ["prod-read-write"]
 
 **Security** — Zero stored credentials, automatic token expiration (30-60 min), centralised access control, full audit trail with JWT claims logged as entity metadata.
 
-**Cost** — 98% client count reduction (400 pipelines → 4-8 managed identities), ~$1,800+/year savings, scales without increasing client count.
-
 **Operations** — Single auth method, no credential rotation, easy pipeline onboarding, simplified troubleshooting.
 
 ## Repository Structure
@@ -150,7 +148,6 @@ azdo-oidc-vault/
 - [ ] Secrets retrieved in pipeline via curl
 - [ ] Authentication time < 3 seconds
 - [ ] 99%+ success rate
-- [ ] Client count reduced to 4-8 entities
 
 ## Getting Help
 

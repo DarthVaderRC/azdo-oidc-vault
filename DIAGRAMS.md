@@ -19,14 +19,14 @@
 │              │  (Managed Identity)         │                        │
 │              └──────────────┬──────────────┘                        │
 │                            │                                        │
-│         Generates Access Token (via Azure CLI)                     │
-│         with Claims:                                               │
-│         - iss: https://sts.windows.net/{tenant-id}/                │
-│         - aud: https://management.core.windows.net/                │
-│         - appid: {managed-identity-client-id}                      │
-│         - oid: {managed-identity-principal-id}                     │
-│         - sub: {managed-identity-principal-id}                     │
-│         - tid: {tenant-id}                                         │
+│         Generates Access Token (via Azure CLI)                      │
+│         with Claims:                                                │
+│         - iss: https://sts.windows.net/{tenant-id}/                 │
+│         - aud: https://management.core.windows.net/                 │
+│         - appid: {managed-identity-client-id}                       │
+│         - oid: {managed-identity-principal-id}                      │
+│         - sub: {managed-identity-principal-id}                      │
+│         - tid: {tenant-id}                                          │
 └─────────────────────────────┬───────────────────────────────────────┘
                               │
                               │ Access Token (JWT)
@@ -38,18 +38,18 @@
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │                    JWT Auth Method                            │  │
 │  │                                                               │  │
-│  │  1. Validate JWT signature against Entra ID JWKS             │  │
-│  │  2. Check issuer (sts.windows.net/{tenant}/)                 │  │
-│  │  3. Match bound_audiences (management.core.windows.net)      │  │
-│  │  4. Verify bound_claims (oid, appid, tid)                    │  │
-│  │  5. Return Vault token with policies                         │  │
+│  │  1. Validate JWT signature against Entra ID JWKS              │  │
+│  │  2. Check issuer (sts.windows.net/{tenant}/)                  │  │
+│  │  3. Match bound_audiences (management.core.windows.net)       │  │
+│  │  4. Verify bound_claims (oid, appid, tid)                     │  │
+│  │  5. Return Vault token with policies                          │  │
 │  └──────────────────────────┬────────────────────────────────────┘  │
 │                             │                                       │
 │         ┌───────────────────┴───────────────────┐                   │
 │         │                                       │                   │
 │         ▼                                       ▼                   │
 │  ┌─────────────┐                        ┌─────────────┐             │
-│  │ Role: dev-  │                        │ Role: prod- │            │
+│  │ Role: dev-  │                        │ Role: prod- │             │
 │  │ pipelines   │                        │ pipelines   │             │
 │  │ bound_claims│                        │ bound_claims│             │
 │  │ oid={dev-mi}│                        │ oid={prod-mi}│            │

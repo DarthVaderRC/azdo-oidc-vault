@@ -1,0 +1,137 @@
+# Azure Pipelines YAML file to demonstrate OIDC authentication with HashiCorp Vault
+# This pipeline retrieves an access token from Azure Entra ID, authenticates to Vault using the token, and retrieves secrets for use in deployment.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  VAULT_ADDR: 'https://your-vault-instance.com:8200'
+  VAULT_NAMESPACE: 'admin'
+  AZDO_SVC_CONN: 'azure-vault-connection' 
+  JWT_ROLE: 'azdo-pipelines'
+
+stages:
+  - stage: DeployWithVault
+    displayName: 'Deploy application with Vault secrets'
+    jobs:
+      - job: GetSecretsFromVault
+        displayName: 'Authenticate to Vault and retrieve secrets'
+        steps:
+        # Step 1: Get access token from Azure Entra ID
+        - task: AzureCLI@2
+          displayName: 'Get access token from Entra ID'
+          inputs:
+            azureSubscription: '$(AZDO_SVC_CONN)'
+            scriptType: bash
+            addSpnToEnvironment: true
+            inlineScript: |
+              echo "Getting access token from Azure Entra ID..."
+
+              # Get access token for Azure management API
+              ACCESS_TOKEN=$(az account get-access-token \
+                --resource https://management.core.windows.net/ \
+                --query accessToken -o tsv)
+              
+              if [ -z "$ACCESS_TOKEN" ]; then
+                echo "##vso[task.logissue type=error]Failed to obtain access token."
+                exit 1
+              fi
+
+              echo "Access token successfully obtained (length: ${#ACCESS_TOKEN})"
+
+              # Optional: Decode and inspect access token claims for debugging
+              echo "=== Access Token Claims ==="
+              echo $ACCESS_TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+              
+              # Export access token for the next steps (marked as secret)
+              echo "##vso[task.setvariable variable=ACCESS_TOKEN;issecret=true]$ACCESS_TOKEN"
+              
+        # STEP 2: Authenticate to Vault using access token
+        - task: Bash@3
+          displayName: 'Authenticate to Vault using access token'
+          env:
+            VAULT_ADDR: $(VAULT_ADDR)
+            VAULT_NAMESPACE: $(VAULT_NAMESPACE)
+            JWT_ROLE: $(JWT_ROLE)
+            ACCESS_TOKEN: $(ACCESS_TOKEN) # Accessing the secret variable from previous step
+          inputs:
+            targetType: 'inline'
+            script: |      
+              echo "Authenticating to Vault..."
+              echo "Vault Address: ${VAULT_ADDR}"
+              echo "Namespace: ${VAULT_NAMESPACE}"
+              echo "JWT Role: ${JWT_ROLE}"
+
+              # Authenticate to Vault using the access token
+              VAULT_RESPONSE=$(curl -s --request POST "$VAULT_ADDR/v1/auth/jwt/login" \
+                --header "X-Vault-Namespace: $VAULT_NAMESPACE" \
+                --data "{\"role\":\"$JWT_ROLE\", \"jwt\":\"$ACCESS_TOKEN\"}" | jq)
+
+              # Extract the Vault client token
+              VAULT_TOKEN=$(echo "$VAULT_RESPONSE" | jq -r '.auth.client_token')
+
+              if [ "$VAULT_TOKEN" = "null" ] || [ -z "$VAULT_TOKEN" ]; then
+                  echo "##vso[task.logissue type=error]Vault login failed. Response: $VAULT_RESPONSE"
+                  exit 1
+              fi
+
+              echo "Successfully authenticated to Vault! Setting token variable."
+              
+              # Export Vault token as a secret variable for next steps
+              echo "##vso[task.setvariable variable=vaultToken;issecret=true]$VAULT_TOKEN"
+
+        # STEP 3: Retrieve secrets from Vault
+        - task: Bash@3
+          displayName: 'Retrieve secrets from Vault'
+          env:
+            VAULT_ADDR: $(VAULT_ADDR)
+            VAULT_NAMESPACE: $(VAULT_NAMESPACE)
+            TOKEN: $(vaultToken) # Accessing the secret Vault token from previous step
+          inputs:
+            targetType: 'inline'
+            script: |              
+              echo "Retrieving secrets from Vault..."
+
+              # Read secrets from Vault using Curl
+              SECRET_RESPONSE=$(curl -s --request GET "$VAULT_ADDR/v1/secret/data/dev/app-config" --header "X-Vault-Token: $TOKEN" --header "X-Vault-Namespace: $VAULT_NAMESPACE" | jq)
+
+              # Check if secret retrieval was successful
+              if [ $? -ne 0 ]; then
+                echo "##vso[task.logissue type=error]Failed to retrieve secrets"
+                exit 1
+              fi
+              
+              # Extract specific secrets
+              DATABASE_URL=$(echo "$SECRET_RESPONSE" | jq -r '.data.data.database_url')
+              API_KEY=$(echo "$SECRET_RESPONSE" | jq -r '.data.data.api_key')
+              
+              echo "Successfully retrieved secrets!"
+              echo "Database URL: ${DATABASE_URL}"
+              echo "API Key: [REDACTED]"
+              
+              # Export secrets as pipeline variables (marked as secret)
+              echo "##vso[task.setvariable variable=DATABASE_URL;issecret=true]${DATABASE_URL}"
+              echo "##vso[task.setvariable variable=API_KEY;issecret=true]${API_KEY}"
+      
+        # Step 4: Use secrets in your application
+        - task: Bash@3
+          displayName: 'Deploy application with secrets'
+          env:
+            DATABASE_URL: $(DATABASE_URL)
+            API_KEY: $(API_KEY)
+          inputs:
+            targetType: 'inline'
+            script: |
+              echo "Deploying application..."
+              echo "Database: ${DATABASE_URL}"
+              echo "API Key: [REDACTED]"
+              
+              # Your deployment commands here
+              # docker run -e DATABASE_URL="${DATABASE_URL}" -e API_KEY="${API_KEY}" myapp
+              
+              echo "Deployment complete!"

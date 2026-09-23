@@ -1,118 +1,120 @@
 # Integrate Azure DevOps pipelines with Vault using Entra ID OIDC (Part 2) - Advanced config, Troublshooting and best practices
 
+> **Corrected on 23 September 2026.** This article originally said that binding a Vault role to a
+> specific service connection was not possible, and recommended one managed identity per environment
+> as the finest grain available. That was wrong: the `sub` claim it quoted *is* the service
+> connection. The sections below have been corrected against a tested build; see
+> [DESIGN_REVIEW.md](../../DESIGN_REVIEW.md) for the measurements.
+
 *Advanced configurations, troubleshooting and debugging tips, and security best practices for production hardening*
 
-In [part 1](placeholder for medium blog), you configured Vault JWT auth, created policies and roles, set up the Azure DevOps service connection, and verified secret retrieval from a pipeline. This document builds on that baseline with advanced environment configurations, practical troubleshooting and debugging workflows, and security hardening guidance for production-ready operations.
+In part 1 you configured Vault JWT auth, created policies and roles, set up the Azure DevOps service connection, and verified secret retrieval from a pipeline. This document builds on that baseline with advanced environment configurations, practical troubleshooting and debugging workflows, and security hardening guidance for production-ready operations.
 
 ## Advanced configurations
 
-### Multiple managed identities for different environments
+### One role per pipeline
 
-Create separate managed identities and Vault roles for different environments. This approach provides environment-level isolation using different managed identities for production and development pipelines.
-
+Bind each Vault role to the **subject of one service connection**. That subject is what Entra writes
+into the token, and it names the connection rather than the managed identity behind it, so pipelines
+sharing an identity remain distinguishable.
 
 ```bash
-# Get managed identity details for each environment
-PROD_MI_CLIENT_ID="prod-managed-identity-client-id"
-PROD_MI_PRINCIPAL_ID="prod-managed-identity-principal-id"
-
-DEV_MI_CLIENT_ID="dev-managed-identity-client-id"
-DEV_MI_PRINCIPAL_ID="dev-managed-identity-principal-id"
-
 AZURE_TENANT_ID="your-tenant-id"
 
-# Production role - stricter policies with shorter TTL
-vault write auth/jwt/role/prod-pipelines \
+# Each connection's subject, exactly as the service connection page shows it.
+SUB_A="/eid1/c/pub/t/<tenant>/a/<azdo-app>/sc/<organisation>/<connection-a-id>"
+SUB_B="/eid1/c/pub/t/<tenant>/a/<azdo-app>/sc/<organisation>/<connection-b-id>"
+
+vault write auth/jwt/role/pipeline-a \
+    role_type="jwt" \
+    policies="pipeline-a" \
+    bound_audiences="fb60f99c-7a34-4190-8149-302f77469936" \
+    bound_subject="${SUB_A}" \
+    user_claim="tid" \
+    claim_mappings="sub=pipeline_subject" \
+    token_ttl="5m" \
+    token_num_uses=2
+
+vault write auth/jwt/role/pipeline-b \
+    role_type="jwt" \
+    policies="pipeline-b" \
+    bound_audiences="fb60f99c-7a34-4190-8149-302f77469936" \
+    bound_subject="${SUB_B}" \
+    user_claim="tid" \
+    claim_mappings="sub=pipeline_subject" \
+    token_ttl="5m" \
+    token_num_uses=2
+```
+
+Three choices in there are worth explaining.
+
+**The audience is the application ID, not the URI.** The federated credential is configured with
+`api://AzureADTokenExchange`, but an Entra v2.0 token carries `fb60f99c-7a34-4190-8149-302f77469936`,
+the Azure Token Exchange Endpoint's app ID. Same resource, two spellings. It is a fixed Microsoft
+value, identical in every tenant. Bind to the URI and every login is refused for an audience
+mismatch, which sends you to inspect the federated credential rather than the token.
+
+**`user_claim="tid"` puts every pipeline in one entity.** `user_claim` decides entity identity and
+therefore client count; `bound_subject` decides who may authenticate. They are separate knobs, and
+conflating them is what produces roles that are deliberately too broad. Attribution does not suffer,
+because `claim_mappings` records the full subject on every request.
+
+**A five-minute token with two uses** is enough to read a secret and then revoke itself. Count the
+calls: login does not consume a use, each read does, and revocation needs one.
+
+### Environment isolation
+
+Separate managed identities per environment still make sense, for blast radius in Azure rather than
+for identity in Vault: a production identity that nothing else shares cannot be handed a federated
+credential by someone with access to the development resource group. But the Vault role should still
+bind the subject, not the identity, or every pipeline in that environment gets the same access.
+
+```bash
+vault write auth/jwt/role/prod-deploy \
     role_type="jwt" \
     policies="prod-secrets-reader" \
-    bound_audiences="https://management.core.windows.net/" \
-    user_claim="sub" \
-    bound_claims="sub=${PROD_MI_PRINCIPAL_ID},appid=${PROD_MI_CLIENT_ID},tid=${AZURE_TENANT_ID}" \
-    claim_mappings="oid=managed_identity_oid,appid=managed_identity_client_id,tid=tenant_id" \
-    ttl="30m" \
-    max_ttl="1h"
-
-# Development role - longer TTL for convenience
-vault write auth/jwt/role/dev-pipelines \
-    role_type="jwt" \
-    policies="dev-secrets-reader" \
-    bound_audiences="https://management.core.windows.net/" \
-    user_claim="sub" \
-    bound_claims="sub=${DEV_MI_PRINCIPAL_ID},appid=${DEV_MI_CLIENT_ID},tid=${AZURE_TENANT_ID}" \
-    claim_mappings="oid=managed_identity_oid,appid=managed_identity_client_id,tid=tenant_id" \
-    ttl="1h"
+    bound_audiences="fb60f99c-7a34-4190-8149-302f77469936" \
+    bound_subject="${SUB_PROD_DEPLOY}" \
+    user_claim="tid" \
+    claim_mappings="sub=pipeline_subject" \
+    token_ttl="5m" \
+    token_num_uses=2
 ```
 
-### Security Boundaries
+### Security boundaries
 
-#### Understanding identity granularity
+#### What the token can and cannot express
 
-This integration provides **managed-identity-level authorization**, which matches the granularity of Azure's native auth method. It's important to understand what this means:
+**Correction.** An earlier version of this document said binding to a specific service connection was
+not possible, and recommended one managed identity per environment as the finest available grain. That
+was wrong, and the evidence was already on the page: the `sub` claim shown above *is* the service
+connection. Measured against a live tenant, two pipelines sharing one managed identity produce
+different subjects, and a role bound to one of them refuses the other with HTTP 400.
 
-**What you get:**
-- Identity tied to specific managed identity (via `oid`, `appid`, `sub` claims)
-- Different managed identities can have different Vault access
-- Reliable, consistent claims that don't change
-- Microsoft-approved authorization claims
-- Same granularity as Azure auth method
+**In the token, and therefore enforceable by Vault:**
 
-**What you don't get:**
-- Pipeline-execution-level identity (no pipeline_id, repository, or branch in token)
-- Per-repository or per-branch access control at the token level
+- The **service connection**, via `sub`. One connection is one pipeline, provided you authorise
+  pipelines to connections individually rather than checking "grant access to all pipelines".
+- The **tenant**, via `tid`.
+- The **issuer** and **audience**.
 
-**Why we used access tokens instead of ID tokens:**
+**Not in the token, at all:**
 
-We initially explored using ID tokens (from `addSpnToEnvironment: true`), which contain a structured `sub` claim:
-```json
-{
-  "sub": "/eid1/c/pub/t/{tenant}/a/{azdo-app}/sc/{org-id}/{federated-credential-id}",
-  "aud": "api://AzureADTokenExchange"
-}
-```
+- Repository, branch, pipeline definition ID, run ID.
+- The managed identity behind the connection. Its `/a/` segment is the Azure DevOps first-party
+  application, the same value in every organisation.
 
-However, ID tokens have significant limitations. There are only a handful of claims that can be used for authentication and authorization but doesn't provide sufficient level of fine-grained controls. For example:
-- The `oid` claim doesn't match the managed identity's principal ID
-- The `sub` claim changes for each service connection (i.e.federated credential)
-- No `appid` claim to bind to the managed identity's client ID
-- The audience is generic (`api://AzureADTokenExchange`)
+So branch protection cannot come from Vault. It comes from Azure DevOps, on the connection itself:
 
-Access tokens, by contrast, provide reliable managed identity claims:
-```json
-{
-  "aud": "https://management.core.windows.net/",
-  "appid": "{managed-identity-client-id}",
-  "oid": "{managed-identity-principal-id}",
-  "sub": "{managed-identity-principal-id}"
-}
-```
+- **Branch control check** on the service connection: the pipeline may use it only when running from
+  an allowed branch, and optionally only when branch protection is enabled.
+- **Required template check**: the pipeline must extend a template you control, which is how you
+  guarantee a step you wrote runs before anything else.
+- **Per-pipeline authorisation**: each pipeline is granted the connection explicitly.
 
-These claims are explicitly designed for authorization decisions per Microsoft's [documentation](https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference#payload-claims).
-
-**Practical implications:**
-
-```hcl
-# POSSIBLE: Bind to specific managed identity
-path "secret/data/prod/*" {
-  capabilities = ["read"]
-  # Only this managed identity can access
-}
-
-# POSSIBLE: Different managed identities for different environments
-# prod-managed-identity -> prod secrets
-# dev-managed-identity -> dev secrets
-
-# NOT POSSIBLE: Bind to specific service connection
-# Multiple service connections can use the same managed identity
-
-# NOT POSSIBLE: Bind to specific repository or branch
-# The token doesn't contain repository or branch information
-```
-
-**Recommendation:** For finer-grained access control:
-1. Use different managed identities for different environments (dev, staging, prod)
-2. Use Azure DevOps pipeline permissions to control which pipelines can use which service connections
-3. Implement additional authorization in your application code
-4. Combine with Azure RBAC for resource-level access control
+Those checks are evaluated by Azure DevOps before the token is ever minted, so a run from the wrong
+branch never reaches Vault. That is a different enforcement point from a bound claim, and worth
+stating plainly to a security reviewer rather than implying Vault is checking the branch.
 
 ## Troubleshooting
 
@@ -163,17 +165,30 @@ curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
 # Expected: https://login.microsoftonline.com/{tenant}/v2.0
 ```
 
-2. **Verify bound issuer matches access token issuer**
+2. **Verify the issuer**
 ```bash
-# Access token issuer claim must match bound_issuer in config
 vault read auth/jwt/config
-# Expected bound_issuer: https://sts.windows.net/{tenant}/
+# Expected: https://login.microsoftonline.com/{tenant}/v2.0
+# If this says sts.windows.net, you are configured for the retiring
+# access-token path. See STEP_1.
 ```
 
-3. **Check audience claim**
+3. **Check the audience**
 ```bash
-# Access token aud claim must match bound_audiences in role
-# Should be: https://management.core.windows.net/
+vault read auth/jwt/role/<role>
+# The token's aud is the Azure Token Exchange Endpoint's application ID:
+#   fb60f99c-7a34-4190-8149-302f77469936
+# NOT api://AzureADTokenExchange, which is what the federated credential is
+# configured with. Vault compares the literal string, and reports only an
+# audience mismatch, which sends you to the wrong object.
+```
+
+4. **Check the subject**
+```bash
+vault read auth/jwt/role/<role>
+# bound_subject must equal the service connection's subject exactly, /eid1/
+# prefix included. This is the most common cause by some distance, and the
+# error says only that a claim did not match, not which one.
 ```
 
 #### Issue 3: Service connection not working
@@ -185,14 +200,19 @@ Failed to get access token
 
 **Solutions:**
 
-1. **Verify service connection type**: Must be "Workload Identity federation (automatic)"
+1. **Verify the service connection type**: Workload Identity Federation with a managed identity.
+   Manual mode is easier to debug, because it shows you the issuer and subject it generated.
 
-2. **Check Azure permissions**: Need at least Contributor role
+2. **Check that the pipeline is authorised to use the connection**: its Security page, not Azure
+   RBAC. This is deliberate, and it is the authorisation boundary the whole design rests on.
 
-3. **Test connection in Azure DevOps**:
-   - Go to service connection settings
-   - Click "Verify" button
-   - Check error messages
+3. **If you fetch the token from the REST API** rather than with `AzureCLI@2`, the job must reference
+   the connection in some task input, even one that never runs, or the OidcToken endpoint refuses:
+   *"There is no explicit reference to service connection ... from current stage."*
+
+4. **If you use `AzureCLI@2`**, the identity needs a role assignment somewhere in the subscription, or
+   `az account set` fails with *"The subscription of '...' doesn't exist in cloud 'AzureCloud'"*. Reader
+   on the resource group holding the identity is enough.
 
 #### Issue 4: Secrets not found
 
@@ -239,41 +259,39 @@ Add this to your pipeline for debugging:
     scriptType: bash
     addSpnToEnvironment: true
     inlineScript: |
-      echo "=== Debugging Access Token ==="
-      
-      # Get access token
-      ACCESS_TOKEN=$(az account get-access-token \
-        --resource https://management.core.windows.net/ \
-        --query accessToken -o tsv)
-      
-      echo "Token length: ${#ACCESS_TOKEN}"
+      echo "=== Debugging the ID token ==="
+
+      # addSpnToEnvironment exposes the ID token as idToken.
+      # Print the payload only. The signature is what makes a token usable, so
+      # it never goes in a log, and neither does $idToken itself.
+      echo "$idToken" | cut -d'.' -f2 \
+        | tr '_-' '/+' | base64 -d 2>/dev/null | jq '.'
+
       echo ""
-      echo "Decoded claims:"
-      echo "${ACCESS_TOKEN}" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq '.'
+      echo "Expected:"
+      echo "- iss: https://login.microsoftonline.com/{tenant}/v2.0"
+      echo "- aud: fb60f99c-7a34-4190-8149-302f77469936"
+      echo "- sub: /eid1/c/pub/t/{tenant}/a/{azdo-app}/sc/{org}/{connection-id}"
+      echo "- tid: {tenant}"
       echo ""
-      echo "Expected claims:"
-      echo "- iss: https://sts.windows.net/{tenant}/"
-      echo "- aud: https://management.core.windows.net/"
-      echo "- appid: {managed-identity-client-id}"
-      echo "- oid: {managed-identity-principal-id}"
-      echo "- sub: {managed-identity-principal-id}"
+      echo "Azure DevOps masks the issuer and subject registered on THIS"
+      echo "connection as *** in its own logs. That is a display filter."
+      echo "Vault's audit log has the full value."
 ```
 
-#### Test authentication manually
+#### You cannot test this token from your laptop
 
-You can test Vault authentication outside the pipeline using the access token:
+Worth saying plainly, because it is the first thing everyone tries. The token is minted for a service
+connection, by Azure DevOps, inside a job it has authorised. `az account get-access-token` on your
+machine returns a token for *you*, with a different issuer, audience and subject, and Vault will
+refuse it. There is no local equivalent.
+
+Debug from a pipeline run instead, with the task above, and read the result from Vault's audit log
+rather than from the build log.
 
 ```bash
-# Get access token using Azure CLI
-ACCESS_TOKEN=$(az account get-access-token \
-  --resource https://management.core.windows.net/ \
-  --query accessToken -o tsv)
-
-# Test authentication
-curl -X POST \
-  -H "X-Vault-Namespace: admin" \
-  -d "{\"jwt\": \"${ACCESS_TOKEN}\", \"role\": \"azdo-pipelines\"}" \
-  https://your-vault.com:8200/v1/auth/jwt/login | jq
+# What the server saw, which is the account that matters
+vault read sys/internal/counters/activity   # or your audit log destination
 ```
 
 #### Check Vault audit logs
@@ -292,9 +310,14 @@ tail -f /vault/logs/audit.log | jq 'select(.type=="response" and .request.path==
 
 ### Token management
 
-1. **Use short TTLs**: Set `token_ttl` to the minimum needed (30-60 minutes)
-2. **Enable token renewal**: For long-running jobs, implement token renewal
-3. **Mask secrets in logs**: Always use `issecret=true` when setting variables
+1. **Use short TTLs.** Minutes, not hours. The tested build uses `token_ttl=5m` with
+   `token_num_uses=2`, which is enough to read a secret and then revoke.
+2. **Revoke rather than renew.** Have the job call `auth/token/revoke-self` in an `EXIT` trap, so the
+   credential dies with the job whether it succeeded or failed. Renewal keeps a credential alive; it
+   is the opposite of what you want here. Leave the `default` policy attached, since that is what
+   grants `revoke-self`.
+3. **Mask secrets in logs**, with `issecret=true`. Understand its limit: it filters one exact string,
+   so anything derived from the secret, split, re-encoded or concatenated, prints unmasked.
 
 ```yaml
 # Good: Secret masked in logs
@@ -308,31 +331,29 @@ echo "##vso[task.setvariable variable=SECRET]${SECRET_VALUE}"
 
 1. **Principle of least privilege**: Grant minimum necessary permissions
 2. **Separate policies per environment**: Dev, staging, prod should have different policies
-3. **Use appropriate claims for bound claims**: Restrict which service connections can use which roles
+3. **Bind the subject, not the identity.** This is the whole point: a role bound to the managed
+   identity is a role every pipeline behind that identity can use.
 
 ```hcl
-# Good: Specific managed identity with all required claims
-bound_audiences = ["https://management.core.windows.net/"]
-bound_claims = {
-  sub   = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"  # MI principal ID
-  appid = "YYYYYYYY-YYYY-YYYY-YYYY-YYYYYYYYYYYY"  # MI client ID
-  tid   = "2ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ"  # Tenant ID
-}
+# Good: this role belongs to exactly one service connection
+bound_audiences = ["fb60f99c-7a34-4190-8149-302f77469936"]
+bound_subject   = "/eid1/c/pub/t/<tenant>/a/<azdo-app>/sc/<organisation>/<connection-id>"
+user_claim      = "tid"
+claim_mappings  = { sub = "pipeline_subject" }
 
-# Acceptable: Tenant-level validation only
-bound_audiences = ["https://management.core.windows.net/"]
+# Not acceptable: every workload in the tenant satisfies this, including
+# virtual machines, function apps and other teams' pipelines
 bound_claims = {
-  tid = "2ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ"
-}
-
-# Best: Combine with bound_issuer for defense in depth
-bound_issuer = "https://sts.windows.net/2ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ/"
-bound_audiences = ["https://management.core.windows.net/"]
-bound_claims = {
-  sub   = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
-  appid = "YYYYYYYY-YYYY-YYYY-YYYY-YYYYYYYYYYYY"
+  tid = "<tenant>"
 }
 ```
+
+   Tenant-level validation was described as "acceptable" in an earlier version of this document. It is
+   not. `tid` is identical in every token your tenant issues, so a role bound to `tid` alone is a
+   tenant role wearing a pipeline's name.
+
+4. **Do not set `default_role` on the mount.** A login that names no role gets it, and whatever it can
+   reach, without ever having asked.
 
 ### Audit and monitoring
 
@@ -355,7 +376,7 @@ cat /vault/logs/audit.log | \
 
 ## Wrap up
 
-You now have practical guidance to harden and operate this integration in production. Revisit [part 1](./medium-blog-v0.1.md) anytime you need the foundational setup and end-to-end verification flow.
+You now have practical guidance to harden and operate this integration in production. Revisit part 1 anytime you need the foundational setup and end-to-end verification flow.
 
 ### Additional resources
 
@@ -364,6 +385,6 @@ You now have practical guidance to harden and operate this integration in produc
 - [Azure workload identity federation](https://learn.microsoft.com/en-us/azure/active-directory/workload-identities/workload-identity-federation)
 - [Azure DevOps service connections](https://learn.microsoft.com/en-us/azure/devops/pipelines/library/service-endpoints)
 - [HCP Vault](https://cloud.hashicorp.com/products/vault)
-- [Access tokens in Microsoft identity platform](https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens)
-- [Access token claims reference](https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference)
+- [ID token claims reference](https://learn.microsoft.com/en-us/entra/identity-platform/id-token-claims-reference)
+- [Workload identity federation considerations](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-considerations)
 

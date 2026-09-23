@@ -366,8 +366,8 @@ Three things the build settled that this report left open:
 - **The backing identity can hold no Azure role assignment at all**, provided the pipeline uses the REST method. `AzureCLI@2` needs one, because it selects a subscription.
 
 Some of the files cited above no longer exist. `azure-pipeline.yml`, `WORKING_EXAMPLE.md`,
-`DIAGRAMS.md`, `policy.hcl`, `bound-claims.json` and `samples/vault-config-using-terraform.md` were
-withdrawn on 23 September 2026 rather than corrected: each one taught the access-token design end to
+`DIAGRAMS.md`, `policy.hcl`, `bound-claims.json`, `samples/vault-config-using-terraform.md` and
+`samples/azure-pipelines-vault.yml` were withdrawn on 23 September 2026 rather than corrected: each one taught the access-token design end to
 end, and a half-corrected copy is worse than none. The line references in this report are to the repository
 as it stood when the review was written, and git history still holds every one of them.
 

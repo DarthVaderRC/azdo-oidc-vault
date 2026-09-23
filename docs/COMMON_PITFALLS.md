@@ -1,254 +1,192 @@
-# Common Pitfalls and Solutions
+# Common pitfalls
 
-> **Partly corrected.** Some entries below assume the earlier access-token design, which is
-> superseded: see [`terraform/`](../terraform/) and [DESIGN_REVIEW.md](DESIGN_REVIEW.md). The security
-> corrections have been applied; the rest is still being reviewed.
+Symptoms, causes, and the reasoning. Ordered by how much time each one costs before you find it.
 
-## 1. Azure DevOps OIDC Token Access
+## 1. Every login fails with an audience mismatch
 
-### Problem
-Azure DevOps doesn't expose raw JWT tokens directly in pipeline steps.
+```
+error validating token: invalid audience (aud) claim
+```
 
-### Solution Options
+The federated credential is configured with `api://AzureADTokenExchange`, and that is the value
+everyone binds the Vault role to. The token that arrives carries something else:
 
-#### Option A: Azure AD Federation (Recommended for Production)
+```
+aud = fb60f99c-7a34-4190-8149-302f77469936
+```
+
+That is the application ID of the Azure Token Exchange Endpoint. Same resource, two spellings, and an
+Entra v2.0 token carries the app ID. It is a fixed Microsoft value, identical in every tenant.
+
+Bind the GUID. The reason this one costs a day is that the error names the audience, so you go and
+inspect the federated credential, where `api://AzureADTokenExchange` is sitting exactly as documented.
+
+```bash
+# What the role expects
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  "${VAULT_ADDR}/v1/auth/azdo-jwt/role/pipeline-a" | jq -r '.data.bound_audiences[]'
+```
+
+## 2. The subject does not match
+
+```
+claim "sub" does not match any associated bound claim values
+```
+
+Usually one of four things:
+
+- The subject was copied with a segment trimmed. It begins with `/eid1/` and there is no leading
+  `https://`.
+- The service connection was deleted and recreated. Its ID changed, so its subject changed, and both
+  the federated credential and the Vault role need the new one.
+- You bound the managed identity's principal ID, from the older access-token design. The identity does
+  not appear in this subject at all.
+- The connection is federating through the retiring Azure DevOps issuer, so the subject begins
+  `https://vstoken.dev.azure.com/`. Recreate it, and check your organisation is connected to Entra.
+
+Compare them directly rather than by eye:
+
+```bash
+# What the role expects
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  "${VAULT_ADDR}/v1/auth/azdo-jwt/role/pipeline-a" | jq -r '.data.bound_claims.sub'
+
+# What the token carries, from a pipeline task. Payload only: the signature is
+# what makes a token usable, so it never goes in a log, and neither does
+# $idToken itself.
+echo "$idToken" | cut -d'.' -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq -r '.sub'
+```
+
+Azure DevOps masks this connection's own issuer and subject as `***` in its own build log. That is a
+display filter, not redaction: Vault's audit record holds the full value.
+
+## 3. `There is no explicit reference to service connection`
+
+You are fetching the token from the OidcToken REST API, and the job never mentions the connection.
+The set of connections a job may use is computed from task inputs when the job is **queued**, so a
+task with `condition: false` still declares it and a variable holding its ID does not.
+
 ```yaml
-steps:
-  - task: AzureCLI@2
-    inputs:
-      azureSubscription: 'your-service-connection'
-      scriptType: 'bash'
-      addSpnToEnvironment: true
-      inlineScript: |
-        # Get token from Azure AD (federated with AZDO)
-        TOKEN=$(az account get-access-token --resource https://management.core.windows.net/ -o tsv --query accessToken)
-        echo "##vso[task.setvariable variable=JWT_TOKEN;issecret=true]${TOKEN}"
+- task: AzureCLI@2
+  displayName: 'Declare the service connection (never runs)'
+  condition: false
+  inputs:
+    azureSubscription: 'vault-pipeline-a'
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: 'true'
 ```
 
----
+## 4. `The subscription of '...' doesn't exist in cloud 'AzureCloud'`
 
-## 2. Bound Claims Not Matching
+`AzureCLI@2` signs in and then runs `az account set`. A subscription the identity holds no role
+assignment in does not appear in its account list at all, so selection fails. The sign-in itself
+succeeded, which is why the error is confusing.
 
-### Problem
-OIDC authentication fails with "permission denied" even though role exists.
+Either grant the identity Reader on the resource group holding it, which is the smallest grant that
+satisfies the check, or switch to the REST method, which needs no Azure permission whatsoever.
 
-### Diagnosis
+## 5. The pipeline queues forever with no error
+
+No parallel job in the organisation. New organisations often have none, Microsoft grants free
+Microsoft-hosted parallelism on request, and the request takes days. Organisation settings, Parallel
+jobs. Nothing in the pipeline log says this.
+
+## 6. Authentication works, reading the secret does not
+
+```
+Error: 403 permission denied
+```
+
+The role authenticated, the policy did not permit the path. Check the actual path, not the one you
+meant:
+
 ```bash
-# Get JWT token claims. cut -f2 takes the payload only: the signature is what makes a
-# token usable, so keep it out of the log and never echo ${JWT_TOKEN} itself.
-echo "${JWT_TOKEN}" | cut -d'.' -f2 | base64 -d | jq
-
-# Check actual claims vs bound claims
-vault read auth/jwt/role/your-role
-
-# Common mismatches:
-# - Issuer URL format
-# - Audience value
-# - Claim names (case-sensitive)
-```
-
-### Solution
-```hcl
-# Recommended: Exact match with managed identity claims
-bound_claims = {
-  sub   = "your-managed-identity-principal-id"
-  appid = "your-managed-identity-client-id"
-  tid   = "your-azure-tenant-id"
-}
-
-# Alternative: Glob pattern for flexibility (e.g., tenant-level)
-bound_claims_type = "glob"
-bound_claims = {
-  tid = "your-azure-tenant-id"
-}
-```
-
----
-
-## 3. Token Expiration During Long-Running Jobs
-
-### Problem
-Pipeline job takes 2+ hours, but Vault token expires after 1 hour.
-
-### Solution
-
-#### Option A: Token Renewal
-```bash
-# Renew token periodically
-while true; do
-  vault token renew
-  sleep 1800  # Renew every 30 minutes
-done &
-
-RENEW_PID=$!
-
-# Your long-running job
-./deploy-application.sh
-
-# Cleanup
-kill ${RENEW_PID}
-```
-
-#### Option B: Longer TTL (Not Recommended)
-```hcl
-resource "vault_jwt_auth_backend_role" "long_running" {
-  token_ttl     = 7200   # 2 hours
-  token_max_ttl = 14400  # 4 hours
-}
-```
-
-#### Option C: Re-authenticate (Recommended)
-```yaml
-stages:
-  - stage: Build
-    jobs:
-      - job: BuildJob
-        steps:
-          - template: vault-auth.yml  # Authenticate
-          - script: ./build.sh
-  
-  - stage: Deploy
-    jobs:
-      - job: DeployJob
-        steps:
-          - template: vault-auth.yml  # Re-authenticate for new stage
-          - script: ./deploy.sh
-```
-
----
-
-## 4. OIDC Discovery URL Not Accessible
-
-### Problem
-```
-Error: failed to verify token: error validating token: unable to verify token signature
-```
-
-### Diagnosis
-```bash
-# Check if Vault can reach OIDC discovery URL
-curl https://login.microsoftonline.com/<tenant-id>/v2.0/.well-known/openid-configuration
-
-# From HCP Vault cluster, verify network access
-# HCP Vault needs internet access to Entra ID's OIDC endpoint
-```
-
-### Solution
-```bash
-# For HCP Vault: No action needed (has internet access)
-
-# For self-hosted Vault: Ensure firewall allows outbound HTTPS
-# Allow: vault-server → login.microsoftonline.com:443
-
-# Verify in Vault
-vault read auth/jwt/config
-# Should show: oidc_discovery_url
-```
-
----
-
-## 5. Policy Permissions Too Restrictive
-
-### Problem
-Pipeline can authenticate but can't read secrets.
-
-### Diagnosis
-```bash
-# Check assigned policies
-vault token lookup
-
-# Test policy
-vault policy test your-policy secret/data/prod/app-config
-
-# Check actual secret path
-vault kv list secret/
-vault kv list secret/prod/
-```
-
-### Solution
-```hcl
-# Ensure policy matches KV v2 path structure
-# Wrong:
-path "secret/prod/*" {
+# KV v2 inserts /data/ into the API path but not the CLI path. A policy on
+# secret/dev/* grants nothing to a read of secret/data/dev/...
+path "secret/data/dev/app-config" {
   capabilities = ["read"]
 }
-
-# Correct for KV v2:
-path "secret/data/prod/*" {
-  capabilities = ["read"]
-}
-
-path "secret/metadata/prod/*" {
-  capabilities = ["list"]
-}
 ```
 
----
+Check the mount path too. A policy naming `aws/creds/...` grants nothing if the engine is mounted at
+`aws-dev/`.
 
-## 6. Environment Variable Not Set in Pipeline
+## 7. Revocation fails, and everything else worked
 
-### Problem
-```
-Error: VAULT_TOKEN not set
-```
+Two causes, both configuration rather than code:
 
-### Solution
-```yaml
-# Ensure variable is properly exported between steps
+- **`token_no_default_policy = true`**. `auth/token/revoke-self` is granted by the default policy.
+  Removing it silently converts every credential into one that lives its full TTL.
+- **`token_num_uses` exhausted.** Login does not consume a use; each subsequent request does, and the
+  revoke is a request. One read plus one revoke needs `token_num_uses = 2`.
 
-# Wrong:
-- script: |
-    VAULT_TOKEN="hvs.xxx"
-    # Only available in this script block
+Both fail at the end of the job, where nobody is watching, and neither fails the build.
 
-# Correct:
-- script: |
-    VAULT_TOKEN="hvs.xxx"
-    echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true]${VAULT_TOKEN}"
+Also: `revoke-self` answers **204 with no body**. Piping it to `jq` and expecting JSON produces a
+confusing error from a call that succeeded.
 
-# Use in next step:
-- script: |
-    curl --header "X-Vault-Token: $(VAULT_TOKEN)" "${VAULT_ADDR}/v1/auth/token/lookup-self"
-```
+## 8. `AccessDenied` on `CreateUser`, reported by Vault
 
-Do not echo the token to check it arrived. `issecret=true` masks known secret values in the log, but
-it is a display filter on one string, not a guarantee: a token that is transformed, split or
-concatenated before it is printed comes out unmasked. `lookup-self` answers the same question,
-"did the token survive the step boundary", without putting it on screen.
+The AWS secrets engine is trying to create a dynamic IAM user, and your account will not let it. In a
+constrained account this is almost always one of two settings:
 
----
+- **`username_template`**, which belongs on the **mount**, not the role. Vault's default generates
+  `vault-token-...` names, which an account that conditions `iam:CreateUser` on a name prefix denies.
+  Keep the generated name within IAM's 64-character limit.
+- **`permissions_boundary_arn`**, which belongs on the **role**. Some accounts deny `CreateUser`
+  unless the new user carries an exact boundary.
 
-## Quick Troubleshooting Checklist
+## 9. Keeping the token out of the logs
+
+The habits, in order of how much they matter:
+
+**Do not promote the Vault token to a pipeline variable.**
+`##vso[task.setvariable variable=VAULT_TOKEN;issecret=true]` moves it from the task that earned it to
+the whole job, readable by every later step. Keep the token, the credential and the work inside one
+task. `isOutput=true` is worse: a secret crossing a job boundary is not masked in the job that
+receives it.
+
+**Do not echo a token to check it arrived.** `issecret=true` masks one exact string. Anything derived
+from it, split, re-encoded, or concatenated, prints unmasked. To confirm a token works:
 
 ```bash
-# 1. Verify Vault connectivity
-vault status
-
-# 2. Check JWT config
-vault read auth/jwt/config
-
-# 3. List and verify roles
-vault list auth/jwt/role
-vault read auth/jwt/role/your-role
-
-# 4. Test authentication with verbose logging
-VAULT_LOG_LEVEL=debug vault write auth/jwt/login \
-  role="your-role" \
-  jwt="${JWT_TOKEN}"
-
-# 5. Verify policies
-vault policy list
-vault policy read your-policy
-
-# 6. Check entity count
-vault list identity/entity/id
-
-# 7. Review audit logs
-vault audit list
-# Check audit logs in HCP Vault Portal
-
-# 8. Test secret access
-vault kv get secret/path/to/secret
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  "${VAULT_ADDR}/v1/auth/token/lookup-self"
 ```
 
----
+**Do not print a response body on failure.** The login response contains `client_token`, and a failure
+that reached your error branch for some reason other than a refused login still has one in it. Print
+`.errors[]` instead.
+
+**Printing the token's payload is fine, and useful.** `cut -d'.' -f2` is the claims; the signature is
+what makes a token usable. Never print the whole token.
+
+## 10. You cannot test any of this from your laptop
+
+The token is minted for a service connection, by Azure DevOps, inside a job it has authorised.
+`az account get-access-token` on your machine returns a token for *you*, with a different issuer,
+audience and subject, and Vault will refuse it. There is no local equivalent, and time spent looking
+for one is time lost.
+
+Debug from a pipeline run, and read the result from Vault's audit log rather than the build log.
+
+## Quick checks
+
+```bash
+# The mount validates the issuer you expect, and has no default_role
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  "${VAULT_ADDR}/v1/auth/azdo-jwt/config" \
+  | jq '{oidc_discovery_url:.data.oidc_discovery_url, bound_issuer:.data.bound_issuer, default_role:.data.default_role}'
+
+# The role is pinned to one subject, with the GUID audience
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  "${VAULT_ADDR}/v1/auth/azdo-jwt/role/pipeline-a" \
+  | jq '{bound_audiences:.data.bound_audiences, sub:.data.bound_claims.sub, user_claim:.data.user_claim, token_num_uses:.data.token_num_uses, token_policies:.data.token_policies}'
+
+# Nothing is left behind between runs
+aws iam list-users --query "Users[?contains(UserName,'vault-')].UserName"
+```
+
+The Vault UI cannot display JWT roles on a mount, so the API is the only way to read one back.

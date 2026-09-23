@@ -90,12 +90,12 @@ export VAULT_TOKEN="$(cat "$HOME/.vault-token")"
 
 `chmod 600` it, and note that `AWS_ACCESS_KEY_ID` and friends take precedence over `AWS_PROFILE`, so a shell that has them exported will ignore the profile above.
 
-The scripts in [demo/](demo/README.md) source this file too, and take the names of the objects Terraform created from `terraform output` rather than from here.
+The scripts in [demo/](../demo/README.md) source this file too, and take the names of the objects Terraform created from `terraform output` rather than from here.
 
 ## Configure
 
 ```bash
-cd poc/terraform
+cd terraform
 cp example.tfvars terraform.tfvars
 ```
 
@@ -112,7 +112,7 @@ One variable, `pipeline_mode`, drives both which resources exist and what the pi
 ### Phase 1: identity chain and token inspection
 
 ```bash
-cd poc/terraform
+cd terraform
 terraform init
 terraform apply -parallelism=1 -var pipeline_mode=inspect -var token_method=both
 ```

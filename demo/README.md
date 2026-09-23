@@ -16,8 +16,8 @@ Two sources, deliberately separate.
 
 **Credentials and endpoints** come from `~/.zsp-poc.env`, which every script sources if it exists. That
 file is yours and is not in this repository. It sets `AZDO_ORG_SERVICE_URL`, `AZDO_PERSONAL_ACCESS_TOKEN`,
-`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_NAMESPACE`, `AWS_PROFILE` and `AWS_REGION`. The README in the parent
-directory shows the whole file.
+`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_NAMESPACE`, `AWS_PROFILE` and `AWS_REGION`.
+[docs/VALIDATION.md](../docs/VALIDATION.md) shows the whole file.
 
 **Names of the things Terraform created** come from Terraform:
 

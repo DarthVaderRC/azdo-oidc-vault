@@ -1,7 +1,7 @@
 # Common Pitfalls and Solutions
 
 > **Partly corrected.** Some entries below assume the earlier access-token design, which is
-> superseded: see [`poc/`](poc/) and [docs/DESIGN_REVIEW.md](docs/DESIGN_REVIEW.md). The security
+> superseded: see [`terraform/`](../terraform/) and [DESIGN_REVIEW.md](DESIGN_REVIEW.md). The security
 > corrections have been applied; the rest is still being reviewed.
 
 ## 1. Azure DevOps OIDC Token Access

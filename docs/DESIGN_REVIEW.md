@@ -14,7 +14,7 @@ What the review settled, and what the current build implements:
 | Authorisation grain | Per pipeline, via one service connection per pipeline boundary |
 | Task-level scoping | Reframed. The need is audit and visibility, not secret segregation between tasks. Met by claim mappings and audit records rather than per-task authentication |
 
-The build that came out of it, with its measured results, is in [poc/README.md](../poc/README.md).
+The build that came out of it, with its measured results, is in [VALIDATION.md](VALIDATION.md).
 
 ---
 
@@ -357,7 +357,7 @@ The practical consequence is that per-pipeline authorisation costs nothing in en
 
 ## 9. What happened next
 
-Every recommendation above was built and measured. The configuration is in [poc/terraform](../poc/terraform), the pipeline in [poc/pipelines](../poc/pipelines), and the nine acceptance tests with their evidence in [poc/README.md](../poc/README.md).
+Every recommendation above was built and measured. The configuration is in [terraform](../terraform), the pipeline in [pipelines](../pipelines), and the nine acceptance tests with their evidence in [VALIDATION.md](VALIDATION.md).
 
 Three things the build settled that this report left open:
 

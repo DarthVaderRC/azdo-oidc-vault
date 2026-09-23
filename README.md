@@ -8,12 +8,12 @@ There are two things in this repository, and they are not equal.
 
 | | What it is | State |
 |---|---|---|
-| [`poc/`](poc/) | Terraform, a pipeline template and the scripts that prove it, built and run end to end | **Tested.** Start here |
-| `STEP_1` to `STEP_5`, `COMMON_PITFALLS.md` | A manual, click-and-curl walkthrough written earlier | Older design, being corrected. See below |
+| [`terraform/`](terraform/), [`pipelines/`](pipelines/), [`demo/`](demo/) | Terraform, a pipeline template and the scripts that prove it, built and run end to end | **Tested.** Start here |
+| [`docs/manual-setup/`](docs/manual-setup/) | A manual, click-and-curl walkthrough written earlier | Older design, being corrected. See below |
 
 ## The earlier guidance is withdrawn
 
-The STEP guides describe a design built on an **Azure Resource Manager access token**: the pipeline
+The guides in `docs/manual-setup/` describe a design built on an **Azure Resource Manager access token**: the pipeline
 calls `az account get-access-token`, and Vault validates a token issued by `sts.windows.net` for the
 `https://management.core.windows.net/` audience. That works, and it is what the first version of this
 repository recommended.
@@ -88,12 +88,12 @@ account and HCP Vault cluster. Among them:
 - No Vault token, AWS key or raw JWT appears in any pipeline log, checked by script across every log
   part of every run.
 
-The full table, with the evidence for each, is in [poc/README.md](poc/README.md).
+The full table, with the evidence for each, is in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## Getting started
 
 ```bash
-cd poc/terraform
+cd terraform
 cp example.tfvars terraform.tfvars   # fill in three values
 terraform init
 terraform apply -parallelism=1
@@ -103,22 +103,21 @@ terraform apply -parallelism=1
 Everything else, including the Vault mounts, roles, policies, service connections, federated
 credentials and the pipelines themselves, is created for you.
 
-To show it to an audience rather than read about it, [poc/DEMONSTRATING.md](poc/DEMONSTRATING.md) is
+To show it to an audience rather than read about it, [docs/DEMONSTRATING.md](docs/DEMONSTRATING.md) is
 a three-act walkthrough with the questions people actually ask and what to answer.
 
 ## Repository map
 
 ```
-poc/
-  terraform/          the whole build
-  pipelines/          the pipeline template and the script it runs
-  demo/               watchers for IAM, Vault's audit log, and a log scanner
-  README.md           what was measured, with the nine acceptance tests
-  DEMONSTRATING.md    how to demonstrate this live
+terraform/            the whole build
+pipelines/            the pipeline template and the script it runs
+demo/                 watchers for IAM, Vault's audit log, and a log scanner
 docs/
+  VALIDATION.md       what was measured, with the nine acceptance tests
+  DEMONSTRATING.md    how to demonstrate this live
   DESIGN_REVIEW.md    the design argument, and what was rejected
-STEP_1..STEP_5.md     the manual path, older design, being corrected
-COMMON_PITFALLS.md    troubleshooting, partly corrected
+  COMMON_PITFALLS.md  troubleshooting, partly corrected
+  manual-setup/       STEP_1 to STEP_5, the older design, being corrected
 ```
 
 ## Prerequisites
@@ -133,6 +132,6 @@ The first two stall a fresh organisation for longer than anything else here. Che
 
 ## Getting help
 
-- [COMMON_PITFALLS.md](COMMON_PITFALLS.md) for symptoms and causes
+- [docs/COMMON_PITFALLS.md](docs/COMMON_PITFALLS.md) for symptoms and causes
 - HashiCorp Community: https://discuss.hashicorp.com
 - HCP Vault Support: https://support.hashicorp.com

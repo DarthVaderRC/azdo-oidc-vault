@@ -1,7 +1,7 @@
 # Demonstrating this
 
 How to show this build to people who have to decide whether to adopt it. The evidence behind every
-claim is in [README.md](README.md); this is how to put it in front of a room.
+claim is in [VALIDATION.md](VALIDATION.md); this is how to put it in front of a room.
 
 Demonstrate it live rather than describing it. The moment that lands is an IAM user appearing on one
 screen while the pipeline runs and vanishing before the run ends. A slide claiming the same thing does
@@ -318,7 +318,7 @@ promise this.
 | Audit watcher finds no log group | The audit user lost the tags the account's boundary scopes log groups by | Check its tags. Without them every write is denied while HCP still reports streaming as healthy |
 
 **If the live run fails outright**, do not debug on stage. Switch to the recorded evidence in
-[README.md](README.md), which has the full log excerpts and the audit output, and offer to re-run at
+[VALIDATION.md](VALIDATION.md), which has the full log excerpts and the audit output, and offer to re-run at
 the end. A calm fallback reads better than a fix attempted in front of decision-makers.
 
 ---

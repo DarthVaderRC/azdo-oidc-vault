@@ -72,7 +72,7 @@ resource "azurerm_role_assignment" "identity_reader" {
 # subject Azure DevOps generates for it.
 #
 # Azure does not support concurrent writes of federated credentials on one
-# managed identity, so apply with -parallelism=1. See poc/README.md.
+# managed identity, so apply with -parallelism=1. See docs/VALIDATION.md.
 resource "azurerm_federated_identity_credential" "pipeline" {
   for_each = var.pipelines
 

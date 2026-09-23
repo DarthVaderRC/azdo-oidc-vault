@@ -1,0 +1,19 @@
+# Optional. Copy to backend.tf to keep state in HCP Terraform rather than in a
+# local terraform.tfstate file. backend.tf is gitignored, so your organisation
+# and workspace names stay yours.
+#
+#   cp backend.tf.example backend.tf
+#   export TF_CLOUD_ORGANIZATION=<your HCP Terraform organisation>
+#   terraform init
+#
+# Set the workspace's execution mode to Local. Remote execution does not
+# receive terraform.tfvars or any CLI variable, and does not hold the Azure,
+# Azure DevOps, Vault and AWS credentials this configuration reads from the
+# environment, so a remote run fails looking for them.
+terraform {
+  cloud {
+    workspaces {
+      name = "zsp-poc"
+    }
+  }
+}

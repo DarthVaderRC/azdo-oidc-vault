@@ -44,7 +44,11 @@ Azure DevOps service connections with **managed identity** enable JWT authentica
 6. Select resource group containing your managed identity
 7. Select the managed identity name
 8. Service connection name: `vault-managed-identity`
-9. Grant access to all pipelines: ✓
+9. Grant access to all pipelines: **leave unchecked**
+
+> Checking that box lets every pipeline in the project use this connection, including ones added later
+> by anyone who can create a pipeline. The connection is what Vault trusts, so that is the whole
+> authorisation boundary. Authorise pipelines to it one at a time, from the connection's Security page.
 
 **Note:** The managed identity must already exist in Azure. If you don't have one, create it first:
 ```bash

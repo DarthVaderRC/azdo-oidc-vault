@@ -94,8 +94,7 @@ curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
      --data "$(cat <<EOF
 {
   "oidc_discovery_url": "https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0",
-  "bound_issuer": "https://sts.windows.net/${AZURE_TENANT_ID}/",
-  "default_role": "azdo-pipelines"
+  "bound_issuer": "https://sts.windows.net/${AZURE_TENANT_ID}/"
 }
 EOF
 )" \
@@ -107,6 +106,9 @@ EOF
 - **bound_issuer**: `sts.windows.net/{tenant}/` (access token issuer)
 - **oidc_discovery_url**: `login.microsoftonline.com` (for JWKS validation)
 - No `oidc_client_id` needed for JWT validation
+- **No `default_role`.** Set one, and a login that names no role gets it. Every caller holding any
+  token this mount accepts then lands on that role's policies without having asked for them. Make each
+  pipeline name its own role, so the role it gets is a decision rather than a fallback.
 
 ### 2.5.2 Understand Access Token Claims and Authorization
 
@@ -264,6 +266,7 @@ curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
   "token_max_ttl": 14400,
   "token_policies": ["azdo-secrets-reader"],
   "bound_claims": {
+    "sub": "${MANAGED_IDENTITY_PRINCIPAL_ID}",
     "tid": "${AZURE_TENANT_ID}"
   }
 }
@@ -280,6 +283,11 @@ EOF
   - `sub` - Managed identity's principal (object) ID
   - `appid` - Managed identity's client ID
   - `tid` - Azure tenant ID
+
+> **Bind more than `tid`.** Every token your tenant issues carries the same `tid`, so a role bound to
+> `tid` alone accepts any workload in the tenant: another team's pipeline, a VM, a function app. It is
+> not a pipeline role, it is a tenant role. Always pin `sub`, or `sub` and `appid` together, to the
+> identity you actually mean.
 - `claim_mappings` - Exports token claims as metadata for audit logging
 - `ttl` - Vault tokens valid for specified duration
 
@@ -317,6 +325,10 @@ EOF
 ```
 
 ### Policy 3: General AZDO Reader (POC)
+
+> **This one reads every secret in the namespace.** It exists to get a first login working, and it is
+> the single most likely thing here to outlive the POC: it never fails, so nothing ever forces you to
+> replace it. Attach it to nothing you keep. Policies 1 and 2 above are the shape to copy.
 
 ```bash
 curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
@@ -478,8 +490,7 @@ curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
      --request POST \
      --data "{
        \"oidc_discovery_url\": \"https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0\",
-       \"bound_issuer\": \"https://sts.windows.net/${AZURE_TENANT_ID}/\",
-       \"default_role\": \"dev-mi-role\"
+       \"bound_issuer\": \"https://sts.windows.net/${AZURE_TENANT_ID}/\"
      }" \
      ${VAULT_ADDR}/v1/auth/jwt/config
 
@@ -513,7 +524,7 @@ curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
      --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
      --request PUT \
      --data '{
-       "policy": "path \"secret/data/*\" {\n  capabilities = [\"read\", \"list\"]\n}"
+       "policy": "path \"secret/data/dev/*\" {\n  capabilities = [\"read\", \"list\"]\n}\n\npath \"secret/metadata/dev/*\" {\n  capabilities = [\"list\"]\n}"
      }' \
      ${VAULT_ADDR}/v1/sys/policies/acl/azdo-secrets-reader
 

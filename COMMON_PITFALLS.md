@@ -30,7 +30,8 @@ OIDC authentication fails with "permission denied" even though role exists.
 
 ### Diagnosis
 ```bash
-# Get JWT token claims
+# Get JWT token claims. cut -f2 takes the payload only: the signature is what makes a
+# token usable, so keep it out of the log and never echo ${JWT_TOKEN} itself.
 echo "${JWT_TOKEN}" | cut -d'.' -f2 | base64 -d | jq
 
 # Check actual claims vs bound claims
@@ -203,8 +204,13 @@ Error: VAULT_TOKEN not set
 
 # Use in next step:
 - script: |
-    echo "Token is: $(VAULT_TOKEN)"
+    curl --header "X-Vault-Token: $(VAULT_TOKEN)" "${VAULT_ADDR}/v1/auth/token/lookup-self"
 ```
+
+Do not echo the token to check it arrived. `issecret=true` masks known secret values in the log, but
+it is a display filter on one string, not a guarantee: a token that is transformed, split or
+concatenated before it is printed comes out unmasked. `lookup-self` answers the same question,
+"did the token survive the step boundary", without putting it on screen.
 
 ---
 

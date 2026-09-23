@@ -31,8 +31,7 @@ curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
      --request POST \
      --data "{
        \"oidc_discovery_url\": \"https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0\",
-       \"bound_issuer\": \"https://sts.windows.net/${AZURE_TENANT_ID}/\",
-       \"default_role\": \"azdo-pipelines\"
+       \"bound_issuer\": \"https://sts.windows.net/${AZURE_TENANT_ID}/\"
      }" \
      ${VAULT_ADDR}/v1/auth/jwt/config
 

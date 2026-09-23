@@ -109,7 +109,9 @@ resource "vault_jwt_auth_backend_role" "multi_tenant" {
   
   bound_claims_type = "glob"
   bound_claims = {
-    iss = "https://sts.windows.net/*/",  # Any tenant (multi-tenant)
+    # List the tenants you mean. A glob such as "https://sts.windows.net/*/" matches every tenant
+    # in the world, which means any Azure customer can authenticate to this role.
+    iss = "https://sts.windows.net/${var.partner_tenant_id}/",
   }
   
   token_ttl         = 1800
@@ -147,7 +149,8 @@ resource "vault_jwt_auth_backend" "azdo" {
   
   oidc_discovery_url = "https://login.microsoftonline.com/${var.azure_tenant_id}/v2.0"
   bound_issuer       = "https://sts.windows.net/${var.azure_tenant_id}/"
-  default_role       = "default-azdo"
+
+  # No default_role: a login that names no role would otherwise get it, policies and all.
   
   tune {
     default_lease_ttl = "1h"
@@ -396,11 +399,17 @@ steps:
         
         if [ -z "$VAULT_TOKEN" ] || [ "$VAULT_TOKEN" = "null" ]; then
           echo "Error: Failed to authenticate to Vault"
-          echo "Response: $AUTH_RESPONSE"
+          # Print the errors, not the body. A body that reached here because jq or the
+          # response shape changed, rather than because the login failed, still holds a
+          # usable client_token.
+          echo "$AUTH_RESPONSE" | jq -r '.errors[]? // "no error detail returned"'
           exit 1
         fi
         
-        echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true;isOutput=true]${VAULT_TOKEN}"
+        # No isOutput. A secret passed as a job output variable is not masked in the job
+        # that consumes it, and a Vault token that crosses a job boundary lives longer
+        # than the work it was minted for. Keep it inside this job.
+        echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true]${VAULT_TOKEN}"
 
   - task: Bash@3
     displayName: 'Retrieve Secrets'
@@ -471,11 +480,14 @@ resource "vault_jwt_auth_backend_role" "secure_role" {
   token_ttl       = 1800   # 30 minutes
   token_max_ttl   = 3600   # 1 hour
   
-  # Prevent token renewal beyond max TTL
-  token_no_default_policy = true
-  
-  # Limit token usage
-  token_num_uses = 1  # Single-use token
+  # Leave the default policy attached. It is what grants auth/token/revoke-self, so
+  # dropping it takes away the pipeline's ability to hand the token back when it is
+  # finished, and the token then lives out its full TTL.
+  token_no_default_policy = false
+
+  # Limit token usage. Count the calls first: login itself does not consume a use, but
+  # every read does, and a token that revokes itself needs one use for the revoke.
+  token_num_uses = 2
 }
 ```
 

@@ -1,5 +1,11 @@
 # Step 1: Azure DevOps Setup
 
+> **Superseded, and being corrected.** This guide describes the earlier design, built on an Azure
+> Resource Manager access token. That token names only the managed identity, so it cannot tell two
+> pipelines apart, and Azure DevOps retires its issuer on 1 July 2027. The tested design is in
+> [`poc/`](poc/), and the reasoning is in [docs/DESIGN_REVIEW.md](docs/DESIGN_REVIEW.md). Security
+> corrections have been applied here, but the design has not changed yet.
+
 ## 1.1 Enable Workload Identity Federation in Azure DevOps
 
 Azure DevOps supports Workload Identity Federation natively. We use **managed identity service connections** to obtain **access tokens** from Azure Entra ID. These access tokens contain claims about the managed identity (`sub`, `appid`, `tid`, `oid`) that Vault can validate via JWT auth.

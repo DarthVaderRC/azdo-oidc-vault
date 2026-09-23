@@ -1,5 +1,11 @@
 # Step 3: Azure DevOps Pipeline Integration
 
+> **Superseded, and being corrected.** This guide describes the earlier design, built on an Azure
+> Resource Manager access token. That token names only the managed identity, so it cannot tell two
+> pipelines apart, and Azure DevOps retires its issuer on 1 July 2027. The tested design is in
+> [`poc/`](poc/), and the reasoning is in [docs/DESIGN_REVIEW.md](docs/DESIGN_REVIEW.md). Security
+> corrections have been applied here, but the design has not changed yet.
+
 ## 3.1 Understanding Access Token Flow with Managed Identity
 
 **Important**: We use **access tokens** (not ID tokens) for authorization with managed identities.

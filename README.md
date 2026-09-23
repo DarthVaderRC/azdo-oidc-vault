@@ -1,157 +1,138 @@
-# Azure DevOps OIDC + HCP Vault POC
+# Azure DevOps to HCP Vault, without a stored credential
 
-A comprehensive POC guide for implementing Azure DevOps OIDC authentication with HCP Vault — eliminating stored credentials, reducing client counts, and centralising secret management.
+A pipeline in Azure DevOps proves who it is to Vault using a token Entra ID mints for it, and gets
+back an AWS credential that exists for about thirty seconds. Nothing long-lived is stored anywhere:
+not in a variable group, not in a service connection, not in a secret store.
 
-## Key Approach
+There are two things in this repository, and they are not equal.
 
-- ✅ Uses **Managed Identity** (no app registration needed — works with contributor permissions)
-- ✅ **Access tokens** from Azure CLI (authorisation-ready tokens with MI claims)
-- ✅ **curl commands only** (no Vault CLI binary required)
-- ✅ **JWT auth** with exact claim matching (oid, appid, tid)
-- ✅ **Managed-identity-level** granularity (matches Azure auth method)
-- ✅ Production-ready implementation
+| | What it is | State |
+|---|---|---|
+| [`poc/`](poc/) | Terraform, a pipeline template and the scripts that prove it, built and run end to end | **Tested.** Start here |
+| `STEP_1` to `STEP_5`, `COMMON_PITFALLS.md` | A manual, click-and-curl walkthrough written earlier | Older design, being corrected. See below |
 
-## Architecture
+## The earlier guidance is withdrawn
+
+The STEP guides describe a design built on an **Azure Resource Manager access token**: the pipeline
+calls `az account get-access-token`, and Vault validates a token issued by `sts.windows.net` for the
+`https://management.core.windows.net/` audience. That works, and it is what the first version of this
+repository recommended.
+
+It has two problems, and one of them cannot be fixed.
+
+**It cannot tell two pipelines apart.** An access token describes the managed identity and nothing
+else. Two pipelines sharing an identity produce identical tokens, so Vault cannot give them different
+roles. The only way to separate them is one identity per pipeline, which is the standing-credential
+sprawl this was meant to remove.
+
+**It is being retired.** Azure DevOps ends support for that issuer on 1 July 2027.
+
+The guidance in those files also optimised for **Vault client count**, treating fewer entities as the
+goal. That framing is gone. Client count is a licensing consequence of a design, not a security
+property, and shaping authorisation around it produces roles that are deliberately too broad.
+
+What replaced it, and the reasoning including the options rejected along the way, is in
+[docs/DESIGN_REVIEW.md](docs/DESIGN_REVIEW.md).
+
+## How the tested design works
+
+A pipeline asks Azure DevOps for an **Entra-issued ID token for its own service connection**. The
+subject Entra writes into that token names the *connection*, not the identity behind it. That single
+difference is what makes everything else possible: one managed identity can back many connections,
+and Vault can still bind a role to one exact pipeline.
+
+```mermaid
+flowchart LR
+  Job["Pipeline job"] -->|"1. token for my service connection"| ADO["Azure DevOps"]
+  ADO -->|"2. federated identity credential"| Entra["Entra ID"]
+  Entra -->|"3. ID token whose subject names the connection"| Job
+  Job -->|"4. login, naming its own role"| Vault["Vault JWT auth"]
+  Vault -->|"5. subject must match exactly"| Role["One role per pipeline"]
+  Role -->|"6. token: 5 minutes, 2 uses"| Engine["AWS secrets engine"]
+  Engine -->|"7. dynamic IAM user"| AWS[("AWS")]
+```
+
+A pipeline that offers its token to a sibling's role is refused, because the subject does not match.
+That refusal is one of the acceptance tests, not a claim.
+
+The credential that comes back is created on demand and destroyed by the job that asked for it:
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Job as Pipeline job
+  participant Vault
+  participant AWS
+  Job->>Vault: login with the ID token and a role name
+  Vault-->>Job: Vault token, 300 second TTL, 2 uses
+  Job->>Vault: read the AWS role
+  Vault->>AWS: create IAM user and access key
+  Vault-->>Job: access key and secret key
+  Job->>AWS: do the work it was authorised for
+  Job->>Vault: revoke its own token
+  Vault->>AWS: delete the access key and the user
+  Note over Job,AWS: measured lifetime: 28 to 66 seconds
+```
+
+If the job crashes, the five-minute TTL ends the lease anyway. Revocation is the fast path, not the
+only one.
+
+## What was measured
+
+Nine acceptance tests, run live against a real Azure DevOps organisation, Azure subscription, AWS
+account and HCP Vault cluster. Among them:
+
+- A pipeline offered another pipeline's role is refused, on a claims mismatch.
+- The credential is denied every action its Vault role does not grant.
+- AWS rejects the credential seconds after the job revokes it.
+- No Vault token, AWS key or raw JWT appears in any pipeline log, checked by script across every log
+  part of every run.
+
+The full table, with the evidence for each, is in [poc/README.md](poc/README.md).
+
+## Getting started
+
+```bash
+cd poc/terraform
+cp example.tfvars terraform.tfvars   # fill in three values
+terraform init
+terraform apply -parallelism=1
+```
+
+`example.tfvars` names exactly what a new environment has to supply and what it can leave alone.
+Everything else, including the Vault mounts, roles, policies, service connections, federated
+credentials and the pipelines themselves, is created for you.
+
+To show it to an audience rather than read about it, [poc/DEMONSTRATING.md](poc/DEMONSTRATING.md) is
+a three-act walkthrough with the questions people actually ask and what to answer.
+
+## Repository map
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Azure DevOps Pipeline                                       │
-│  - Obtains access token from Azure Entra ID via Azure CLI   │
-│  - Token contains claims: oid, appid, sub, tid              │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ HCP Vault - JWT Auth Method                                 │
-│  - Validates JWT signature against Entra ID JWKS            │
-│  - Matches bound_claims (sub, appid, tid)                   │
-│  - Returns Vault token with policies                        │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Entity/Alias Management                                     │
-│  - Multiple pipelines → Same entity (via user_claim: sub)   │
-│  - bound_claims control auth success                        │
-│  - claim_mappings export oid, appid, tid as metadata        │
-│  - 1 entity per managed identity = 1 client (licensing)     │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ KV Secrets Engine                                           │
-│  - Read secrets based on policy                             │
-│  - Short-lived tokens (30-60 min)                           │
-│  - No stored credentials in Azure DevOps                    │
-└─────────────────────────────────────────────────────────────┘
+poc/
+  terraform/          the whole build
+  pipelines/          the pipeline template and the script it runs
+  demo/               watchers for IAM, Vault's audit log, and a log scanner
+  README.md           what was measured, with the nine acceptance tests
+  DEMONSTRATING.md    how to demonstrate this live
+docs/
+  DESIGN_REVIEW.md    the design argument, and what was rejected
+STEP_1..STEP_5.md     the manual path, older design, being corrected
+COMMON_PITFALLS.md    troubleshooting, partly corrected
 ```
 
 ## Prerequisites
 
-- [ ] Azure subscription with Contributor permissions
-- [ ] HCP Vault Dedicated cluster
-- [ ] Azure DevOps organisation with a project
-- [ ] Azure CLI installed locally
-- [ ] Git repository for pipeline code
+- An Azure DevOps organisation and project, with a free parallel job available
+- An Entra tenant connected to that organisation
+- An Azure subscription you can create a resource group and a managed identity in
+- An HCP Vault cluster, and an AWS account for the dynamic credentials
+- Terraform, the Azure CLI, and a personal access token for Azure DevOps
 
-## Step-by-Step Implementation
+The first two stall a fresh organisation for longer than anything else here. Check them first.
 
-| Step | Document | Time | Description |
-|------|----------|------|-------------|
-| 1 | [Azure DevOps Setup](STEP_1_AZURE_SETUP.md) | 20 min | Configure Azure DevOps organisation and OIDC |
-| 2 | [HCP Vault Configuration](STEP_2_VAULT_SETUP.md) | 30 min | Enable JWT auth, create roles & policies |
-| 3 | [Pipeline Integration](STEP_3_PIPELINE_INTEGRATION.md) | 45 min | Update pipelines to authenticate with Vault |
-| 4 | [Testing & Validation](STEP_4_TESTING.md) | 30 min | Verify client count reduction |
-| 5 | [Production Deployment](STEP_5_PRODUCTION.md) | 1 hour | Best practices and rollout strategy |
+## Getting help
 
-**Supporting resources:**
-- [DIAGRAMS.md](DIAGRAMS.md) — Visual architecture and flow diagrams
-- [COMMON_PITFALLS.md](COMMON_PITFALLS.md) — Troubleshooting guide
-
-## Why OIDC over Other Approaches
-
-| Aspect | Service Principals | Azure Auth | AppRole | OIDC/JWT (This Guide) |
-|--------|-------------------|------------|---------|-------------------|
-| **Credentials** | Long-lived, stored | Managed identity | Secret ID required | Short-lived, auto-generated (JWT) |
-| **Rotation** | Manual, complex | Automatic | Manual | Automatic |
-| **Client Count** | 1 per pipeline | 1 per identity | 1 per app | Shared via bound claims |
-| **Infrastructure** | None extra | Requires Azure VMs/RGs | None extra | None extra |
-| **Multi-cloud** | Azure only | Azure only | Cloud-agnostic | Cloud-agnostic |
-| **Security Risk** | Credential exposure | Low | Secret exposure | Minimal |
-
-## Bound Claims Strategy
-
-`bound_claims` control authorisation (which pipelines can authenticate), while `user_claim` determines entity consolidation and client licensing.
-
-**Recommended: Managed Identity Consolidation**
-```hcl
-role_type       = "jwt"
-user_claim      = "sub"   # MI principal ID → 1 entity per managed identity
-bound_audiences = ["https://management.core.windows.net/"]
-bound_claims = {
-  sub   = var.managed_identity_principal_id
-  appid = var.managed_identity_client_id
-  tid   = var.azure_tenant_id
-}
-claim_mappings = {
-  oid   = "managed_identity_oid"
-  appid = "managed_identity_client_id"
-  tid   = "tenant_id"
-}
-# Result: All pipelines using this MI share 1 entity
-# Multiple roles can target different MIs for environment isolation
-```
-
-**Multiple Roles for Environment Isolation:**
-```hcl
-# Dev role — read-only, bound to dev managed identity
-bound_claims = {
-  sub   = var.dev_mi_principal_id
-  appid = var.dev_mi_client_id
-  tid   = var.azure_tenant_id
-}
-token_policies = ["dev-read-only"]
-
-# Prod role — read/write, bound to prod managed identity
-bound_claims = {
-  sub   = var.prod_mi_principal_id
-  appid = var.prod_mi_client_id
-  tid   = var.azure_tenant_id
-}
-token_policies = ["prod-read-write"]
-# Result: 2 entities total (1 per managed identity), different policies per role
-```
-
-## Key Benefits
-
-**Security** — Zero stored credentials, automatic token expiration (30-60 min), centralised access control, full audit trail with JWT claims logged as entity metadata.
-
-**Operations** — Single auth method, no credential rotation, easy pipeline onboarding, simplified troubleshooting.
-
-## Repository Structure
-
-```
-azdo-oidc-vault/
-├── README.md                             # This file
-├── DIAGRAMS.md                           # Visual architecture diagrams
-├── STEP_1_AZURE_SETUP.md                 # Azure DevOps configuration
-├── STEP_2_VAULT_SETUP.md                 # HCP Vault setup & JWT auth
-├── STEP_3_PIPELINE_INTEGRATION.md        # Pipeline code updates
-├── STEP_4_TESTING.md                     # Validation & client count checks
-├── STEP_5_PRODUCTION.md                  # Best practices & rollout
-└── COMMON_PITFALLS.md                    # Troubleshooting guide
-```
-
-## Success Criteria
-
-- [ ] JWT authentication working with access tokens
-- [ ] Secrets retrieved in pipeline via curl
-- [ ] Authentication time < 3 seconds
-- [ ] 99%+ success rate
-
-## Getting Help
-
-1. Check [COMMON_PITFALLS.md](COMMON_PITFALLS.md) for troubleshooting
-2. Review the relevant STEP_X guide for section-specific issues
-3. HashiCorp Community: https://discuss.hashicorp.com
-4. HCP Vault Support: https://support.hashicorp.com (HCP customers)
+- [COMMON_PITFALLS.md](COMMON_PITFALLS.md) for symptoms and causes
+- HashiCorp Community: https://discuss.hashicorp.com
+- HCP Vault Support: https://support.hashicorp.com

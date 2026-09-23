@@ -1,563 +1,216 @@
-# Step 2: HCP Vault Dedicated Configuration
+# Step 2: Vault
 
-> **Superseded, and being corrected.** This guide describes the earlier design, built on an Azure
-> Resource Manager access token. That token names only the managed identity, so it cannot tell two
-> pipelines apart, and Azure DevOps retires its issuer on 1 July 2027. The tested design is in
-> [`terraform/`](../../terraform/), and the reasoning is in [DESIGN_REVIEW.md](../DESIGN_REVIEW.md). Security
-> corrections have been applied here, but the design has not changed yet.
+> The tested version of everything here is [`terraform/vault.tf`](../../terraform/vault.tf). This page
+> is the same configuration by hand, with the reasoning.
 
-## 2.1 Spin Up HCP Vault Cluster
-
-1. Login to HCP Portal: https://portal.cloud.hashicorp.com
-2. Navigate to Vault
-3. Create a new cluster:
-   - **Cluster name**: `azdo-oidc-poc`
-   - **Tier**: Starter (or Plus for enterprise features)
-   - **Region**: Choose closest to your Azure region
-4. Wait for cluster to be ready (5-10 minutes)
-5. Note down:
-   - **Cluster URL**: `https://azdo-oidc-poc-vault-abc123.hashicorp.cloud:8200`
-   - **Namespace**: `admin` (default)
-
-## 2.2 Generate Admin Token
-
-1. In HCP Portal, go to your Vault cluster
-2. Click "Generate token"
-3. Copy the token (you'll need it for CLI access)
+Everything uses `curl`, so no Vault binary is required. Set these first:
 
 ```bash
 export VAULT_ADDR="https://your-cluster.hashicorp.cloud:8200"
+export VAULT_TOKEN="<an admin token>"
 export VAULT_NAMESPACE="admin"
-export VAULT_TOKEN="hvs.your-admin-token"
-
-# Test connection
-vault status
 ```
 
-## 2.3 Create Namespace for POC
+## 2.1 Cluster and namespace
 
-Best practice: Use a dedicated namespace for each team/project
+Create an HCP Vault cluster, then a namespace of its own for this work. A namespace keeps the mounts,
+roles and policies below from colliding with anything else in the cluster.
 
 ```bash
-# Create namespace
-vault namespace create azdo-poc
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  -X POST "${VAULT_ADDR}/v1/sys/namespaces/vault-poc"
 
-# Switch to the namespace
-export VAULT_NAMESPACE="admin/azdo-poc"
-
-# Verify
-vault namespace list
+export VAULT_NAMESPACE="admin/vault-poc"
 ```
 
-## 2.4 Enable KV Secrets Engine
+## 2.2 The JWT auth mount
 
 ```bash
-# Enable KV v2 secrets engine using curl
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data '{"type": "kv-v2"}' \
-     ${VAULT_ADDR}/v1/sys/mounts/secret
+AZURE_TENANT_ID="<your tenant id>"
+ENTRA_ISSUER="https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0"
 
-# Create sample secrets for different environments
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data '{"data": {"database_url": "postgresql://dev-db:5432/myapp", "api_key": "dev-api-key-12345", "environment": "development"}}' \
-     ${VAULT_ADDR}/v1/secret/data/dev/app-config
+# Enable the mount. "jwt", not "oidc": there is no browser and no redirect.
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  -X POST -d '{"type":"jwt","description":"Azure DevOps pipelines"}' \
+  "${VAULT_ADDR}/v1/sys/auth/azdo-jwt"
 
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data '{"data": {"database_url": "postgresql://prod-db:5432/myapp", "api_key": "prod-api-key-67890", "environment": "production"}}' \
-     ${VAULT_ADDR}/v1/secret/data/prod/app-config
-
-# Verify secret creation
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/secret/data/dev/app-config | jq
+# Configure it.
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  -X POST -d "{
+    \"oidc_discovery_url\": \"${ENTRA_ISSUER}\",
+    \"bound_issuer\": \"${ENTRA_ISSUER}\"
+  }" \
+  "${VAULT_ADDR}/v1/auth/azdo-jwt/config"
 ```
 
-## 2.5 Configure JWT Auth Method
+Both values are the **same Entra issuer** the service connection showed you in Step 1. Vault fetches
+Entra's signing keys from the discovery URL and refuses any token whose `iss` is something else.
 
-### 2.5.1 Enable JWT Auth
+**Do not set `default_role`.** A login that names no role gets that role and its policies, so the role
+a caller ends up with stops being a decision anyone made. Every pipeline names its own role.
+
+If your service connections do not all share one issuer, one mount cannot validate them all. Check
+before you go further.
+
+## 2.3 One role per pipeline
+
+This is the heart of it.
 
 ```bash
-# Enable JWT auth method (NOT oidc - we're using access tokens from Azure CLI)
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data '{"type": "jwt"}' \
-     ${VAULT_ADDR}/v1/sys/auth/jwt
+# Exactly as the service connection page showed it, /eid1/ prefix included.
+SUB_A="/eid1/c/pub/t/<tenant>/a/<azdo-app>/sc/<organisation>/<connection-a-id>"
 
-# Configure JWT auth with Entra ID as issuer
-# Note: Access tokens use sts.windows.net as issuer, but JWKS from login.microsoftonline.com
-AZURE_TENANT_ID="your-tenant-id"  # Get from Azure Portal
-
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data "$(cat <<EOF
-{
-  "oidc_discovery_url": "https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0",
-  "bound_issuer": "https://sts.windows.net/${AZURE_TENANT_ID}/"
-}
-EOF
-)" \
-     ${VAULT_ADDR}/v1/auth/jwt/config
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  -X POST -d "{
+    \"role_type\": \"jwt\",
+    \"bound_audiences\": [\"fb60f99c-7a34-4190-8149-302f77469936\"],
+    \"bound_claims\": { \"sub\": \"${SUB_A}\" },
+    \"user_claim\": \"tid\",
+    \"claim_mappings\": { \"sub\": \"pipeline_subject\" },
+    \"token_policies\": [\"pipeline-a\"],
+    \"token_ttl\": \"5m\",
+    \"token_max_ttl\": \"5m\",
+    \"token_num_uses\": 2,
+    \"token_no_default_policy\": false
+  }" \
+  "${VAULT_ADDR}/v1/auth/azdo-jwt/role/pipeline-a"
 ```
 
-**Note**: 
-- Replace `${AZURE_TENANT_ID}` with your Azure tenant ID
-- **bound_issuer**: `sts.windows.net/{tenant}/` (access token issuer)
-- **oidc_discovery_url**: `login.microsoftonline.com` (for JWKS validation)
-- No `oidc_client_id` needed for JWT validation
-- **No `default_role`.** Set one, and a login that names no role gets it. Every caller holding any
-  token this mount accepts then lands on that role's policies without having asked for them. Make each
-  pipeline name its own role, so the role it gets is a decision rather than a fallback.
+Repeat for each pipeline, with that pipeline's subject, policy and role name.
 
-### 2.5.2 Understand Access Token Claims and Authorization
+Six decisions in there, and every one of them is a place the earlier guidance went wrong.
 
-This is KEY to reducing client count!
+**`bound_audiences` is a GUID.** The federated credential is configured with
+`api://AzureADTokenExchange`, and the token arrives carrying
+`fb60f99c-7a34-4190-8149-302f77469936`, the application ID of the Azure Token Exchange Endpoint. Same
+resource, two spellings, and an Entra v2.0 token carries the app ID. It is a fixed Microsoft value,
+identical in every tenant, so it is safe to write literally. Bind the documented URI instead and every
+login fails with an audience mismatch, which sends you to inspect the federated credential rather than
+the token.
 
-**Important**: Access tokens from `az account get-access-token` contain these **authorization claims**:
-- `iss`: Issuer (`https://sts.windows.net/{tenant-id}/`)
-- `aud`: Audience (`https://management.core.windows.net/`)
-- `sub`: Managed Identity Principal ID (Object ID)
-- `oid`: Same as `sub` - Managed Identity Principal ID
-- `appid`: Managed Identity Client ID
-- `tid`: Tenant ID
+**`bound_claims.sub` is the authorisation.** It pins the role to one service connection. Two pipelines
+behind the same managed identity have different subjects, so each gets its own role, and offering one
+pipeline's token to another's role is refused. `bound_subject` does the same job; `bound_claims` is
+used here because it extends naturally when you want to pin `tid` as well. Neither accepts a glob
+unless you also set `bound_claims_type`, and a glob here would need to pin the organisation segment to
+be safe at all.
 
-**Why Access Tokens (not ID tokens)?**
-- ✅ **Reliable authorization claims**: `oid`, `appid`, `sub` all identify the managed identity
-- ✅ **Microsoft-approved**: Designed for authorization decisions per [docs](https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference)
-- ✅ **Managed-identity-level granularity**: Same as Azure auth method
-- ❌ **ID tokens don't work**: `oid` doesn't match MI, no `appid` claim, `sub` changes per service connection
+**`user_claim` is not authorisation.** It decides which Vault entity the login resolves to, and
+therefore your client count. `tid` puts every pipeline in the tenant into one entity. That is a
+licensing choice and it costs nothing in attribution, because of the next line. Conflating
+`user_claim` with `bound_claims` is what produces roles that are deliberately too broad.
 
-**Recommendation**: 
-- Use **access tokens** via `az account get-access-token --resource https://management.core.windows.net/`
-- Bind to specific managed identity using `sub` (principal ID), `appid` (client ID), and `tid` (tenant ID)
-- Use `user_claim="sub"` for entity consolidation per managed identity
+**`claim_mappings` is the attribution.** It writes the full subject into the token's metadata, so
+every audit record names the exact pipeline even though the entity is shared. This is the line that
+lets you consolidate entities without losing the ability to answer "which pipeline read that".
+
+**`token_ttl` of five minutes**, not the hour the old guidance suggested. The token needs to live long
+enough to read one credential and hand it back.
+
+**`token_num_uses: 2`.** Login does not consume a use. One read, one `revoke-self`. And
+`token_no_default_policy` stays **false**, because `auth/token/revoke-self` is granted by the default
+policy: turn it on and the pipeline cannot revoke anything, which guarantees the credential lives its
+full TTL.
+
+## 2.4 One policy per pipeline
 
 ```bash
-# Strategy 1: Bind to specific managed identity (RECOMMENDED)
-# All pipelines/service connections using this MI share ONE entity
-bound_claims = {
-  "sub": "ghi13dg6-345b-4c27-4567-eab1208a5ef5",     # MI Principal ID
-  "appid": "xyz456-w4-1234-9012-345678901234",   # MI Client ID
-  "tid": "abc123-def4-5678-9012-345678901234"      # Tenant ID
-}
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  -X PUT -d '{
+    "policy": "path \"aws/creds/pipeline-a\" {\n  capabilities = [\"read\"]\n}"
+  }' \
+  "${VAULT_ADDR}/v1/sys/policies/acl/pipeline-a"
+```
 
-# Strategy 2: Tenant-level (Less restrictive)
-# All managed identities in this tenant can authenticate
-bound_claims = {
-  "tid": "abc123-def4-5678-9012-345678901234"      # Tenant ID only
+One path, one capability. Note what is **not** here: `revoke-self` is not granted, because it comes
+from the default policy, and no KV path is granted, because this pipeline does not read KV.
+
+If you are reading secrets from KV rather than minting AWS credentials, scope it the same way:
+
+```hcl
+path "secret/data/dev/pipeline-a/*" {
+  capabilities = ["read"]
 }
 
-# Strategy 3: Multiple managed identities with same policy (OR pattern)
-# Create separate roles for different managed identities, attach same policy
-# Role 1: dev-mi-role -> dev-managed-identity
-# Role 2: staging-mi-role -> staging-managed-identity
-# Both use same policy but different entities
-```
-
-**CRITICAL for controlling Vault Client Count**:
-- **`user_claim`** determines entity consolidation and licensing
-- **`bound_claims`** control authorization (which tokens can authenticate)
-- **For managed identity consolidation**: Set `user_claim="sub"` (uses MI principal ID)
-- **For authorization**: Use exact matches in `bound_claims` (no glob patterns needed)
-- **Granularity**: Managed-identity-level (NOT service-connection or pipeline-level)
-
-### 2.5.3 Create JWT Roles
-
-#### Role 1: Dev Managed Identity
-
-```bash
-# Get managed identity details
-DEV_MI_PRINCIPAL_ID="your-dev-mi-principal-id"      # Object ID
-DEV_MI_CLIENT_ID="your-dev-mi-client-id"             # Client ID
-AZURE_TENANT_ID="your-tenant-id"
-
-# Create role using curl
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data "$(cat <<EOF
-{
-  "role_type": "jwt",
-  "bound_audiences": ["https://management.core.windows.net/"],
-  "user_claim": "sub",
-  "token_ttl": 3600,
-  "token_max_ttl": 14400,
-  "token_policies": ["dev-secrets-reader"],
-  "bound_claims": {
-    "sub": "${DEV_MI_PRINCIPAL_ID}",
-    "appid": "${DEV_MI_CLIENT_ID}",
-    "tid": "${AZURE_TENANT_ID}"
-  },
-  "claim_mappings": {
-    "oid": "managed_identity_oid",
-    "appid": "managed_identity_client_id",
-    "tid": "tenant_id"
-  }
+path "secret/metadata/dev/pipeline-a/*" {
+  capabilities = ["list"]
 }
-EOF
-)" \
-     ${VAULT_ADDR}/v1/auth/jwt/role/dev-mi-role
 ```
 
-**How to get managed identity values:**
-```bash
-# Option 1: Via Azure Portal
-# Navigate to: Azure Active Directory > Managed Identities > [Your MI]
-# - Object (principal) ID: shown on Overview
-# - Application (client) ID: shown on Overview
+Never `secret/data/*`. A policy that reads everything never fails, so nothing ever forces you to
+replace it, and it will still be attached in two years.
 
-# Option 2: Via Azure CLI
-az identity show \
-  --name "your-dev-managed-identity" \
-  --resource-group "your-resource-group" \
-  --query "{clientId: clientId, principalId: principalId}"
-```
+## 2.5 The AWS secrets engine
 
-#### Role 2: Production Managed Identity
+This is the part that makes "zero standing privileges" true rather than aspirational: the credential
+does not exist until the pipeline asks, and it is destroyed when the pipeline finishes.
 
 ```bash
-# Get production managed identity details
-PROD_MI_PRINCIPAL_ID="your-prod-mi-principal-id"
-PROD_MI_CLIENT_ID="your-prod-mi-client-id"
-AZURE_TENANT_ID="your-tenant-id"
+# Enable the mount.
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  -X POST -d '{"type":"aws"}' "${VAULT_ADDR}/v1/sys/mounts/aws"
 
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data "$(cat <<EOF
-{
-  "role_type": "jwt",
-  "bound_audiences": ["https://management.core.windows.net/"],
-  "user_claim": "sub",
-  "token_ttl": 1800,
-  "token_max_ttl": 3600,
-  "token_policies": ["prod-secrets-reader"],
-  "bound_claims": {
-    "sub": "${PROD_MI_PRINCIPAL_ID}",
-    "appid": "${PROD_MI_CLIENT_ID}",
-    "tid": "${AZURE_TENANT_ID}"
-  },
-  "claim_mappings": {
-    "oid": "managed_identity_oid",
-    "appid": "managed_identity_client_id",
-    "tid": "tenant_id"
-  }
-}
-EOF
-)" \
-     ${VAULT_ADDR}/v1/auth/jwt/role/prod-mi-role
+# Give it a root credential to create IAM users with, and a lease ceiling.
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  -X POST -d "{
+    \"access_key\": \"${AWS_ACCESS_KEY_ID}\",
+    \"secret_key\": \"${AWS_SECRET_ACCESS_KEY}\",
+    \"region\": \"us-east-1\"
+  }" \
+  "${VAULT_ADDR}/v1/aws/config/root"
+
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  -X POST -d '{"default_lease_ttl":"5m","max_lease_ttl":"5m"}' \
+  "${VAULT_ADDR}/v1/sys/mounts/aws/tune"
 ```
 
-#### Role 3: Tenant-Level (For POC/Testing)
+Then a role per pipeline, granting only what that pipeline's work needs:
 
 ```bash
-# Less restrictive - allows any managed identity in tenant
-# Use this for POC to test multiple managed identities easily
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data "$(cat <<EOF
-{
-  "role_type": "jwt",
-  "bound_audiences": ["https://management.core.windows.net/"],
-  "user_claim": "sub",
-  "token_ttl": 3600,
-  "token_max_ttl": 14400,
-  "token_policies": ["azdo-secrets-reader"],
-  "bound_claims": {
-    "sub": "${MANAGED_IDENTITY_PRINCIPAL_ID}",
-    "tid": "${AZURE_TENANT_ID}"
-  }
-}
-EOF
-)" \
-     ${VAULT_ADDR}/v1/auth/jwt/role/azdo-pipelines
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  -X POST -d '{
+    "credential_type": "iam_user",
+    "policy_document": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"ec2:DescribeRegions\"],\"Resource\":\"*\"}]}"
+  }' \
+  "${VAULT_ADDR}/v1/aws/roles/pipeline-a"
 ```
 
-**Understanding the role configuration:**
-- `role_type: "jwt"` - Use JWT validation (not full OIDC flow)
-- `bound_audiences` - Must match access token's `aud` claim
-- `user_claim: "sub"` - Uses managed identity's principal ID for entity
-- `bound_claims` - Validates specific managed identity claims:
-  - `sub` - Managed identity's principal (object) ID
-  - `appid` - Managed identity's client ID
-  - `tid` - Azure tenant ID
+**`credential_type` must be `iam_user`.** It is the only type Vault can revoke before it expires.
+`assumed_role` and `federation_token` produce STS credentials that remain valid until their own
+expiry no matter what you do in Vault, so "the credential is dead the moment the job ends" would
+become "the credential is dead within the hour". If that claim matters to you, this setting is where
+it is won or lost.
 
-> **Bind more than `tid`.** Every token your tenant issues carries the same `tid`, so a role bound to
-> `tid` alone accepts any workload in the tenant: another team's pipeline, a VM, a function app. It is
-> not a pipeline role, it is a tenant role. Always pin `sub`, or `sub` and `appid` together, to the
-> identity you actually mean.
-- `claim_mappings` - Exports token claims as metadata for audit logging
-- `ttl` - Vault tokens valid for specified duration
+Two more settings you may need, depending on how constrained your AWS account is:
 
-## 2.6 Create Policies
+- **`username_template`**, set on the **mount**, not the role. Vault's default produces names like
+  `vault-token-...`, and an account whose IAM policy conditions `iam:CreateUser` on a name prefix
+  will deny every one of them. Keep the generated name inside IAM's 64-character limit.
+- **`permissions_boundary_arn`**, set on the **role**. Some accounts deny `iam:CreateUser` unless the
+  new user carries an exact boundary policy.
 
-### Policy 1: Dev Secrets Reader
+Both produce the same symptom when missing: `AccessDenied` on `CreateUser`, from Vault, at the moment
+a pipeline asks for a credential.
+
+## 2.6 Verify before you leave
 
 ```bash
-# Create policy using curl
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request PUT \
-     --data "$(cat <<'EOF'
-{
-  "policy": "# Allow reading dev secrets\npath \"secret/data/dev/*\" {\n  capabilities = [\"read\", \"list\"]\n}\n\npath \"secret/data/shared/*\" {\n  capabilities = [\"read\", \"list\"]\n}\n\n# Allow listing secrets\npath \"secret/metadata/dev/*\" {\n  capabilities = [\"list\"]\n}"
-}
-EOF
-)" \
-     ${VAULT_ADDR}/v1/sys/policies/acl/dev-secrets-reader
+# The mount validates the issuer you expect.
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  "${VAULT_ADDR}/v1/auth/azdo-jwt/config" | jq '{oidc_discovery_url:.data.oidc_discovery_url, bound_issuer:.data.bound_issuer, default_role:.data.default_role}'
+
+# The role is pinned to one subject, and its audience is the GUID.
+curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  "${VAULT_ADDR}/v1/auth/azdo-jwt/role/pipeline-a" | jq '{bound_audiences:.data.bound_audiences, bound_claims:.data.bound_claims, user_claim:.data.user_claim, token_ttl:.data.token_ttl, token_num_uses:.data.token_num_uses, token_policies:.data.token_policies}'
 ```
 
-### Policy 2: Prod Secrets Reader
+Check, in order: `default_role` is empty, `bound_audiences` is the GUID and not the URI,
+`bound_claims.sub` is this pipeline's subject and not the managed identity's ID, and `token_policies`
+names one policy.
 
-```bash
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request PUT \
-     --data "$(cat <<'EOF'
-{
-  "policy": "# Allow reading prod secrets\npath \"secret/data/prod/*\" {\n  capabilities = [\"read\", \"list\"]\n}\n\npath \"secret/data/shared/*\" {\n  capabilities = [\"read\", \"list\"]\n}\n\n# Allow listing secrets\npath \"secret/metadata/prod/*\" {\n  capabilities = [\"list\"]\n}"
-}
-EOF
-)" \
-     ${VAULT_ADDR}/v1/sys/policies/acl/prod-secrets-reader
-```
+Note that the Vault UI cannot display JWT roles on a mount. The CLI and the API are the only way to
+read one back, which is worth knowing before you go looking for a page that does not exist.
 
-### Policy 3: General AZDO Reader (POC)
+## Next steps
 
-> **This one reads every secret in the namespace.** It exists to get a first login working, and it is
-> the single most likely thing here to outlive the POC: it never fails, so nothing ever forces you to
-> replace it. Attach it to nothing you keep. Policies 1 and 2 above are the shape to copy.
-
-```bash
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request PUT \
-     --data "$(cat <<'EOF'
-{
-  "policy": "# Allow reading all secrets for POC\npath \"secret/data/*\" {\n  capabilities = [\"read\", \"list\"]\n}\n\npath \"secret/metadata/*\" {\n  capabilities = [\"list\"]\n}"
-}
-EOF
-)" \
-     ${VAULT_ADDR}/v1/sys/policies/acl/azdo-secrets-reader
-```
-
-## 2.7 Verify Configuration
-
-```bash
-# List auth methods
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/sys/auth | jq
-
-# View JWT config
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/auth/jwt/config | jq
-
-# Expected output should show:
-# "oidc_discovery_url": "https://login.microsoftonline.com/<tenant-id>/v2.0"
-
-# List JWT roles
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request LIST \
-     ${VAULT_ADDR}/v1/auth/jwt/role | jq
-
-# View specific role
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/auth/jwt/role/dev-mi-role | jq
-
-# List policies
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request LIST \
-     ${VAULT_ADDR}/v1/sys/policies/acl | jq
-
-# Read policy
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/sys/policies/acl/dev-secrets-reader | jq
-```
-
-## 2.8 Understanding Client Count Impact
-
-### Traditional Approach (Service Principals)
-```bash
-# Each service principal creates a unique entity
-Entity 1: sp-app1-dev    → Client 1
-Entity 2: sp-app1-prod   → Client 2
-Entity 3: sp-app2-dev    → Client 3
-...
-Entity 400: sp-appN-prod → Client 400
-```
-
-### Access Token + Managed Identity Approach (Shared Entities)
-```bash
-# Multiple pipelines and service connections share entities per managed identity
-Entity 1: dev-managed-identity  → Shared by 100+ pipelines using dev-mi   → Client 1
-Entity 2: prod-managed-identity → Shared by 200+ pipelines using prod-mi  → Client 2
-Entity 3: platform-mi          → Shared by 50+ pipelines using platform-mi → Client 3
-Entity 4: staging-mi           → Shared by 50+ pipelines using staging-mi  → Client 4
-...
-Total: ~4-8 entities instead of 400+
-Reduction: 98%
-```
-
-### How It Works
-
-1. **First pipeline with dev-managed-identity**:
-   ```
-   Pipeline "app1-dev" → Access Token {sub: dev-mi-principal-id, appid: dev-mi-client-id} 
-                      → Matches role "dev-mi-role"
-                      → Creates Entity A with alias (oid-based)
-                      → Client Count: 1
-   ```
-
-2. **Second pipeline with same managed identity** (different service connection):
-   ```
-   Pipeline "app2-dev" → Access Token {sub: dev-mi-principal-id, appid: dev-mi-client-id}
-   (via different SC)  → Matches same role "dev-mi-role"
-                      → Uses existing Entity A (new alias)
-                      → Client Count: Still 1
-   ```
-
-3. **Third pipeline with different managed identity**:
-   ```
-   Pipeline "app1-prod" → Access Token {sub: prod-mi-principal-id, appid: prod-mi-client-id}
-                       → Matches role "prod-mi-role"
-                       → Creates Entity B with alias
-                       → Client Count: 2
-   ```
-
-**Key Insight**: 
-- Entity = Unique Managed Identity (not service connection or pipeline)
-- Multiple service connections using same MI → Same entity
-- Multiple pipelines using same MI → Same entity
-- Granularity: **Managed-identity-level** (matches Azure auth method)
-
-## 2.9 Enable Audit Logging (Optional but Recommended)
-
-```bash
-# Enable audit device
-vault audit enable file file_path=/vault/logs/audit.log
-
-# View audit logs to track client creation
-vault audit list
-```
-
-## 2.10 Save Configuration Script
-
-Create a script to replicate this setup:
-
-```bash
-#!/bin/bash
-# save as: vault-setup.sh
-
-set -e
-
-echo "Configuring HCP Vault for Azure DevOps with Access Tokens..."
-
-# Variables
-export VAULT_ADDR="https://your-cluster.hashicorp.cloud:8200"
-export VAULT_NAMESPACE="admin"
-export VAULT_TOKEN="hvs.your-admin-token"
-export AZURE_TENANT_ID="your-tenant-id"  # Get from: az account show --query tenantId -o tsv
-export DEV_MI_PRINCIPAL_ID="your-dev-mi-principal-id"
-export DEV_MI_CLIENT_ID="your-dev-mi-client-id"
-
-echo "Vault Address: ${VAULT_ADDR}"
-echo "Namespace: ${VAULT_NAMESPACE}"
-echo "Azure Tenant ID: ${AZURE_TENANT_ID}"
-echo "Dev MI Principal ID: ${DEV_MI_PRINCIPAL_ID}"
-echo "Dev MI Client ID: ${DEV_MI_CLIENT_ID}"
-echo ""
-
-# Enable JWT auth
-echo "Enabling JWT auth method..."
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data '{"type": "jwt"}' \
-     ${VAULT_ADDR}/v1/sys/auth/jwt
-
-# Configure JWT auth with Entra ID
-echo "Configuring JWT auth with Entra ID..."
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data "{
-       \"oidc_discovery_url\": \"https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0\",
-       \"bound_issuer\": \"https://sts.windows.net/${AZURE_TENANT_ID}/\"
-     }" \
-     ${VAULT_ADDR}/v1/auth/jwt/config
-
-# Create JWT role with managed identity claims
-echo "Creating JWT role for dev managed identity..."
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data "{
-       \"role_type\": \"jwt\",
-       \"bound_audiences\": [\"https://management.core.windows.net/\"],
-       \"user_claim\": \"sub\",
-       \"token_ttl\": 3600,
-       \"token_policies\": [\"azdo-secrets-reader\"],
-       \"bound_claims\": {
-         \"sub\": \"${DEV_MI_PRINCIPAL_ID}\",
-         \"appid\": \"${DEV_MI_CLIENT_ID}\",
-         \"tid\": \"${AZURE_TENANT_ID}\"
-       },
-       \"claim_mappings\": {
-         \"oid\": \"managed_identity_oid\",
-         \"appid\": \"managed_identity_client_id\",
-         \"tid\": \"tenant_id\"
-       }
-     }" \
-     ${VAULT_ADDR}/v1/auth/jwt/role/dev-mi-role
-
-# Create policy
-echo "Creating policy..."
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request PUT \
-     --data '{
-       "policy": "path \"secret/data/dev/*\" {\n  capabilities = [\"read\", \"list\"]\n}\n\npath \"secret/metadata/dev/*\" {\n  capabilities = [\"list\"]\n}"
-     }' \
-     ${VAULT_ADDR}/v1/sys/policies/acl/azdo-secrets-reader
-
-# Enable KV engine
-echo "Enabling KV secrets engine..."
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data '{"type": "kv-v2"}' \
-     ${VAULT_ADDR}/v1/sys/mounts/secret
-
-# Add test secret
-echo "Creating test secret..."
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data '{"data": {"database_url": "postgresql://dev-db:5432/myapp", "api_key": "dev-api-key-12345"}}' \
-     ${VAULT_ADDR}/v1/secret/data/dev/app-config
-
-echo ""
-echo "✓ Vault configuration complete!"
-echo "✓ JWT auth enabled with access token validation"
-echo "✓ Issuer: https://sts.windows.net/${AZURE_TENANT_ID}/"
-echo "✓ Discovery URL: https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0"
-echo "✓ Bound to managed identity: ${DEV_MI_PRINCIPAL_ID}"
-```
-
-## Next Steps
-
-Proceed to [Step 3: Azure DevOps Pipeline Integration](STEP_3_PIPELINE_INTEGRATION.md)
+[Step 3: The pipeline](STEP_3_PIPELINE_INTEGRATION.md).

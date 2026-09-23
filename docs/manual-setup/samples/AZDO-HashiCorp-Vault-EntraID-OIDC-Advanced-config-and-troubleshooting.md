@@ -29,7 +29,7 @@ vault write auth/jwt/role/pipeline-a \
     role_type="jwt" \
     policies="pipeline-a" \
     bound_audiences="fb60f99c-7a34-4190-8149-302f77469936" \
-    bound_subject="${SUB_A}" \
+    bound_claims="sub=${SUB_A}" \
     user_claim="tid" \
     claim_mappings="sub=pipeline_subject" \
     token_ttl="5m" \
@@ -39,7 +39,7 @@ vault write auth/jwt/role/pipeline-b \
     role_type="jwt" \
     policies="pipeline-b" \
     bound_audiences="fb60f99c-7a34-4190-8149-302f77469936" \
-    bound_subject="${SUB_B}" \
+    bound_claims="sub=${SUB_B}" \
     user_claim="tid" \
     claim_mappings="sub=pipeline_subject" \
     token_ttl="5m" \
@@ -55,7 +55,7 @@ value, identical in every tenant. Bind to the URI and every login is refused for
 mismatch, which sends you to inspect the federated credential rather than the token.
 
 **`user_claim="tid"` puts every pipeline in one entity.** `user_claim` decides entity identity and
-therefore client count; `bound_subject` decides who may authenticate. They are separate knobs, and
+therefore client count; `bound_claims.sub` decides who may authenticate. They are separate knobs, and
 conflating them is what produces roles that are deliberately too broad. Attribution does not suffer,
 because `claim_mappings` records the full subject on every request.
 
@@ -74,7 +74,7 @@ vault write auth/jwt/role/prod-deploy \
     role_type="jwt" \
     policies="prod-secrets-reader" \
     bound_audiences="fb60f99c-7a34-4190-8149-302f77469936" \
-    bound_subject="${SUB_PROD_DEPLOY}" \
+    bound_claims="sub=${SUB_PROD_DEPLOY}" \
     user_claim="tid" \
     claim_mappings="sub=pipeline_subject" \
     token_ttl="5m" \
@@ -186,7 +186,7 @@ vault read auth/jwt/role/<role>
 4. **Check the subject**
 ```bash
 vault read auth/jwt/role/<role>
-# bound_subject must equal the service connection's subject exactly, /eid1/
+# bound_claims.sub must equal the service connection's subject exactly, /eid1/
 # prefix included. This is the most common cause by some distance, and the
 # error says only that a claim did not match, not which one.
 ```
@@ -337,7 +337,7 @@ echo "##vso[task.setvariable variable=SECRET]${SECRET_VALUE}"
 ```hcl
 # Good: this role belongs to exactly one service connection
 bound_audiences = ["fb60f99c-7a34-4190-8149-302f77469936"]
-bound_subject   = "/eid1/c/pub/t/<tenant>/a/<azdo-app>/sc/<organisation>/<connection-id>"
+bound_claims    = { sub = "/eid1/c/pub/t/<tenant>/a/<azdo-app>/sc/<organisation>/<connection-id>" }
 user_claim      = "tid"
 claim_mappings  = { sub = "pipeline_subject" }
 

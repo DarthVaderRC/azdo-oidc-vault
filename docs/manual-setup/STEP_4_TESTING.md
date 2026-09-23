@@ -1,523 +1,164 @@
-# Step 4: Testing and Client Count Validation
+# Step 4: Testing
 
-> **Superseded, and being corrected.** This guide describes the earlier design, built on an Azure
-> Resource Manager access token. That token names only the managed identity, so it cannot tell two
-> pipelines apart, and Azure DevOps retires its issuer on 1 July 2027. The tested design is in
-> [`terraform/`](../../terraform/), and the reasoning is in [DESIGN_REVIEW.md](../DESIGN_REVIEW.md). Security
-> corrections have been applied here, but the design has not changed yet.
+> These are the nine tests the tested build was measured against. Results from a live run are in
+> [VALIDATION.md](../VALIDATION.md); this page is how to run them yourself.
 
-## 4.1 Test Basic Vault Integration
+The old version of this page measured whether Vault's client count went down. That is a licensing
+question, not a security one, and it told you nothing about whether the design worked. These nine do.
 
-### Test 1: Manual Vault API Authentication (Local)
+Four of them can fail while everything still looks healthy. Those are marked **silent**, and they are
+the reason to run this list rather than trusting a green pipeline.
 
-```bash
-# Set environment variables
-export VAULT_ADDR="https://your-cluster.hashicorp.cloud:8200"
-export VAULT_NAMESPACE="admin"
-export VAULT_TOKEN="hvs.your-admin-token"
+## The list
 
-# Verify connection
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/sys/health | jq
+| # | Test | How | Pass |
+|---|---|---|---|
+| 1 | The pipeline gets only its own policy | Audit log, `auth.policies` | `["default","pipeline-a"]`, nothing else |
+| 2 | It obtains a working credential | Pipeline log | The credential does the work it was granted |
+| 3 | **The credential dies with the run** | Below | `InvalidClientTokenId`, then `NoSuchEntity` |
+| 4 | **One pipeline cannot use another's role** (silent) | Below | HTTP 400, `claim "sub" does not match` |
+| 5 | Access is attributed to one pipeline | Audit log, `pipeline_subject` | Distinct per pipeline, matching the connection ID |
+| 6 | Entity consolidation works as intended | `identity/entity/id` | One entity across many logins |
+| 7 | **No credential reaches the logs** (silent) | Below | Zero matches |
+| 8 | **No unneeded standing privilege** (silent) | Below | The role assignments you expect, and no others |
+| 9 | **The credential cannot exceed its policy** (silent) | Below | A denied call alongside a permitted one |
 
-# Read secrets
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/secret/data/dev/app-config | jq
+## Test 3: the credential dies with the run
 
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/secret/data/prod/app-config | jq
+The one the whole design exists for. Two halves, and the second is the one people skip.
 
-# List secrets
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request LIST \
-     ${VAULT_ADDR}/v1/secret/metadata | jq
-```
-
-### Test 2: Run Azure DevOps Pipeline
-
-1. Commit the pipeline YAML file to your repository
-2. In Azure DevOps, go to Pipelines
-3. Create a new pipeline and select your repository
-4. Select existing YAML file: `azure-pipelines-simple.yml`
-5. Run the pipeline
-6. Verify:
-   - Vault CLI installs successfully
-   - Authentication works
-   - Secrets are retrieved
-
-## 4.2 Monitor Client Count
-
-### Method 1: Using Vault UI
-
-1. Login to HCP Vault Portal
-2. Navigate to your cluster
-3. Go to **"Client Count"** dashboard
-4. Observe active clients after pipeline runs
-
-### Method 2: Using Vault API (curl)
+In the pipeline, after revoking:
 
 ```bash
-# View current client count
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/sys/internal/counters/activity/monthly | jq
-
-# View detailed client information
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/sys/internal/counters/activity/monthly | jq '.data.clients'
-
-# List entities (each entity = 1 client)
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request LIST \
-     ${VAULT_ADDR}/v1/identity/entity/id | jq
-
-# Get entity details
-ENTITY_ID="<entity-id-from-list>"
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/identity/entity/id/${ENTITY_ID} | jq
-
-# View entity aliases
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/identity/entity/id/${ENTITY_ID} | jq '.data.aliases'
+aws sts get-caller-identity 2>&1 | grep -q 'InvalidClientTokenId' \
+  && echo "PASS: AWS rejects the credential after revocation"
 ```
 
-### Method 3: Using Vault API
+Then from your own machine, after the run has finished:
 
 ```bash
-# Get client count
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/sys/internal/counters/activity/monthly
+aws iam get-user --user-name <the user name from the log>
+# An error occurred (NoSuchEntity) ... cannot be found.
 
-# List entities
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request LIST \
-     ${VAULT_ADDR}/v1/identity/entity/id
+aws iam list-users --query "Users[?contains(UserName,'vault-')].UserName"
+# empty between runs
 ```
 
-## 4.3 Test Client Count Reduction
+AWS is eventually consistent, so allow a few seconds and retry rather than concluding on the first
+answer. If the user still exists minutes later, revocation did not happen: check that the `EXIT` trap
+is installed before the first thing that can fail, that `token_no_default_policy` is false, and that
+`token_num_uses` left a use for the revoke.
 
-### Scenario: Multiple Pipelines, Same Bound Claims
+## Test 4: one pipeline cannot use another's role
 
-Create three separate pipelines with the same bound claims:
+**Silent, and the most important test on this page.** If this fails, every other test still passes
+and you have per-pipeline roles that are not actually per-pipeline.
 
-#### Pipeline 1: `pipeline-app1.yml`
-```yaml
-name: App1 Pipeline
-
-trigger: none
-
-pool:
-  vmImage: 'ubuntu-latest'
-
-variables:
-  VAULT_ADDR: 'https://your-cluster.hashicorp.cloud:8200'
-  VAULT_NAMESPACE: 'admin'
-  APP_NAME: 'app1'
-
-steps:
-  - task: AzureCLI@2
-    displayName: 'Get Access Token & Retrieve Secrets for App1'
-    inputs:
-      azureSubscription: 'vault-managed-identity'
-      scriptType: 'bash'
-      scriptLocation: 'inlineScript'
-      inlineScript: |
-        ACCESS_TOKEN=$(az account get-access-token \
-          --resource https://management.core.windows.net/ \
-          --query accessToken -o tsv)
-        
-        VAULT_TOKEN=$(curl --silent --request POST \
-          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
-          --data "{\"jwt\": \"${ACCESS_TOKEN}\", \"role\": \"dev-mi-role\"}" \
-          $(VAULT_ADDR)/v1/auth/jwt/login | jq -r '.auth.client_token')
-        
-        echo "App: $(APP_NAME)"
-        curl --silent \
-          --header "X-Vault-Token: ${VAULT_TOKEN}" \
-          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
-          $(VAULT_ADDR)/v1/secret/data/dev/app-config | jq
-```
-
-#### Pipeline 2: `pipeline-app2.yml`
-```yaml
-name: App2 Pipeline
-
-trigger: none
-
-pool:
-  vmImage: 'ubuntu-latest'
-
-variables:
-  VAULT_ADDR: 'https://your-cluster.hashicorp.cloud:8200'
-  VAULT_NAMESPACE: 'admin'
-  APP_NAME: 'app2'
-
-steps:
-  - task: AzureCLI@2
-    displayName: 'Get Access Token & Retrieve Secrets for App2'
-    inputs:
-      azureSubscription: 'vault-managed-identity'
-      scriptType: 'bash'
-      scriptLocation: 'inlineScript'
-      inlineScript: |
-        ACCESS_TOKEN=$(az account get-access-token \
-          --resource https://management.core.windows.net/ \
-          --query accessToken -o tsv)
-        
-        VAULT_TOKEN=$(curl --silent --request POST \
-          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
-          --data "{\"jwt\": \"${ACCESS_TOKEN}\", \"role\": \"dev-mi-role\"}" \
-          $(VAULT_ADDR)/v1/auth/jwt/login | jq -r '.auth.client_token')
-        
-        echo "App: $(APP_NAME)"
-        curl --silent \
-          --header "X-Vault-Token: ${VAULT_TOKEN}" \
-          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
-          $(VAULT_ADDR)/v1/secret/data/dev/app-config | jq
-```
-
-#### Pipeline 3: `pipeline-app3.yml`
-```yaml
-name: App3 Pipeline
-
-trigger: none
-
-pool:
-  vmImage: 'ubuntu-latest'
-
-variables:
-  VAULT_ADDR: 'https://your-cluster.hashicorp.cloud:8200'
-  VAULT_NAMESPACE: 'admin'
-  APP_NAME: 'app3'
-
-steps:
-  - task: AzureCLI@2
-    displayName: 'Get Access Token & Retrieve Secrets for App3'
-    inputs:
-      azureSubscription: 'vault-managed-identity'
-      scriptType: 'bash'
-      scriptLocation: 'inlineScript'
-      inlineScript: |
-        ACCESS_TOKEN=$(az account get-access-token \
-          --resource https://management.core.windows.net/ \
-          --query accessToken -o tsv)
-        
-        VAULT_TOKEN=$(curl --silent --request POST \
-          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
-          --data "{\"jwt\": \"${ACCESS_TOKEN}\", \"role\": \"dev-mi-role\"}" \
-          $(VAULT_ADDR)/v1/auth/jwt/login | jq -r '.auth.client_token')
-        
-        echo "App: $(APP_NAME)"
-        curl --silent \
-          --header "X-Vault-Token: ${VAULT_TOKEN}" \
-          --header "X-Vault-Namespace: $(VAULT_NAMESPACE)" \
-          $(VAULT_ADDR)/v1/secret/data/dev/app-config | jq
-```
-
-### Expected Result
-
-With **Service Principals**: 3 pipelines = 3 entities = **3 clients**
-
-With **OIDC + Bound Claims** (all in same project): 3 pipelines = 1 entity (with 3 aliases) = **1 client**
-
-### Verification Steps
-
-1. Run Pipeline 1
-   ```bash
-   vault list identity/entity/id
-   # Should see 1 entity
-   ```
-
-2. Run Pipeline 2
-   ```bash
-   vault list identity/entity/id
-   # Should still see 1 entity (or 2 if different role)
-   ```
-
-3. Run Pipeline 3
-   ```bash
-   vault list identity/entity/id
-   # Should still see 1 entity (or 2-3 depending on bound claims)
-   ```
-
-4. Check entity details
-   ```bash
-   ENTITY_ID=$(vault list -format=json identity/entity/id | jq -r '.[]' | head -1)
-   vault read -format=json identity/entity/id/${ENTITY_ID} | jq '.data.aliases'
-   # Should see multiple aliases (one per pipeline run)
-   ```
-
-## 4.4 Generate Client Count Report
-
-Create a script to analyze client count:
-
-File: `scripts/analyze-clients.sh`
+Add a step to pipeline B that offers its own token to pipeline A's role:
 
 ```bash
-#!/bin/bash
+CODE=$(curl -sS -o /tmp/neg.json -w '%{http_code}' -X POST \
+  -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+  -d "{\"role\":\"pipeline-a\",\"jwt\":\"${ID_TOKEN}\"}" \
+  "${VAULT_ADDR}/v1/auth/azdo-jwt/login")
 
-export VAULT_ADDR="https://your-cluster.hashicorp.cloud:8200"
-export VAULT_NAMESPACE="admin/azdo-poc"
-export VAULT_TOKEN="hvs.your-admin-token"
+# A rejection proves nothing if the role does not exist. Check the reason.
+if grep -qiE 'could not be found|unknown role' /tmp/neg.json; then
+  echo "FAIL: role pipeline-a does not exist, so its refusal proves nothing"
+  exit 1
+fi
 
-echo "=========================================="
-echo "Vault Client Count Analysis"
-echo "=========================================="
-echo ""
-
-# Get monthly client count
-echo "1. Monthly Client Count:"
-vault read -format=json sys/internal/counters/activity/monthly | \
-  jq '.data.months[-1] | {month: .timestamp, total_clients: .counts.clients, new_clients: .new_clients.counts.clients}'
-echo ""
-
-# List all entities
-echo "2. Total Entities (Unique Clients):"
-ENTITY_COUNT=$(vault list -format=json identity/entity/id | jq '. | length')
-echo "   Total Entities: ${ENTITY_COUNT}"
-echo ""
-
-# Detailed entity information
-echo "3. Entity Details:"
-vault list -format=json identity/entity/id | jq -r '.[]' | while read entity_id; do
-  ENTITY_INFO=$(vault read -format=json identity/entity/id/${entity_id})
-  
-  ENTITY_NAME=$(echo ${ENTITY_INFO} | jq -r '.data.name')
-  ALIAS_COUNT=$(echo ${ENTITY_INFO} | jq '.data.aliases | length')
-  POLICIES=$(echo ${ENTITY_INFO} | jq -r '.data.policies | join(", ")')
-  
-  echo "   Entity: ${ENTITY_NAME}"
-  echo "   ID: ${entity_id}"
-  echo "   Aliases: ${ALIAS_COUNT}"
-  echo "   Policies: ${POLICIES}"
-  echo "   ---"
-done
-echo ""
-
-# Breakdown by auth method
-echo "4. Breakdown by Auth Method:"
-vault read -format=json sys/internal/counters/activity/monthly | \
-  jq '.data.months[-1].counts.distinct_entities[] | {mount: .mount_path, count: .counts.clients}'
-echo ""
-
-echo "=========================================="
-echo "Analysis Complete"
-echo "=========================================="
+if [ "${CODE}" = "400" ] && grep -q 'does not match' /tmp/neg.json; then
+  echo "PASS: refused on a claims mismatch"
+else
+  echo "FAIL: got ${CODE}"; exit 1
+fi
 ```
 
-Run the script:
-```bash
-chmod +x scripts/analyze-clients.sh
-./scripts/analyze-clients.sh
-```
+The guard matters more than the assertion. A misspelled role name also produces a non-200, so a test
+that accepts any failure reports PASS while proving nothing. Read the reason, not the status.
 
-## 4.5 Validate Cost Savings
+## Test 7: no credential reaches the logs
 
-### Calculate Savings
+**Silent.** Nothing fails when a token is printed; you simply have a token in a log with a long
+retention period.
+
+Download every log part of a run and search it. Counts only, never the matched text:
 
 ```bash
-# Current monthly cost per client (example: HCP Vault Starter)
-COST_PER_CLIENT=0.40  # USD per client per month
-
-# Service Principal approach
-SP_COUNT=400
-SP_MONTHLY_COST=$(echo "${SP_COUNT} * ${COST_PER_CLIENT}" | bc)
-
-# OIDC approach (estimated)
-OIDC_COUNT=15  # 15 entities for different projects/environments
-OIDC_MONTHLY_COST=$(echo "${OIDC_COUNT} * ${COST_PER_CLIENT}" | bc)
-
-# Savings
-SAVINGS=$(echo "${SP_MONTHLY_COST} - ${OIDC_MONTHLY_COST}" | bc)
-SAVINGS_PERCENT=$(echo "scale=2; ${SAVINGS} / ${SP_MONTHLY_COST} * 100" | bc)
-
-echo "Cost Analysis:"
-echo "  Service Principal Approach: ${SP_COUNT} clients = \$${SP_MONTHLY_COST}/month"
-echo "  OIDC Approach: ${OIDC_COUNT} clients = \$${OIDC_MONTHLY_COST}/month"
-echo "  Monthly Savings: \$${SAVINGS}"
-echo "  Savings Percentage: ${SAVINGS_PERCENT}%"
+curl -sS -u ":${AZDO_PAT}" \
+  "${ORG}/${PROJECT}/_apis/build/builds/${BUILD}/logs?api-version=7.0" \
+  | jq -r '.value[].id' \
+  | while read -r id; do
+      curl -sS -u ":${AZDO_PAT}" \
+        "${ORG}/${PROJECT}/_apis/build/builds/${BUILD}/logs/${id}?api-version=7.0"
+    done \
+  | grep -cE 'hvs\.|A[KS]IA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{20,}'
 ```
 
-Expected output:
-```
-Cost Analysis:
-  Service Principal Approach: 400 clients = $160.00/month
-  OIDC Approach: 15 clients = $6.00/month
-  Monthly Savings: $154.00
-  Savings Percentage: 96.25%
-```
+Expect `0`. [`demo/scan-logs.sh`](../../demo/scan-logs.sh) does this across every pipeline's latest
+run.
 
-## 4.6 Test Different Bound Claims Strategies
+Run it against your **most verbose** build, not a quiet one. A debug step added for an afternoon and
+removed is still in that run's logs, and those logs outlive the step.
 
-### Test A: By Managed Identity (Recommended)
+## Test 8: no unneeded standing privilege
+
+**Silent**, because standing privilege never causes a failure. That is the whole problem with it.
 
 ```bash
-# Create role bound to specific managed identity
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data "{
-       \"role_type\": \"jwt\",
-       \"bound_audiences\": [\"https://management.core.windows.net/\"],
-       \"user_claim\": \"sub\",
-       \"token_policies\": [\"dev-secrets-reader\"],
-       \"bound_claims\": {
-         \"sub\": \"${DEV_MI_PRINCIPAL_ID}\",
-         \"appid\": \"${DEV_MI_CLIENT_ID}\",
-         \"tid\": \"${AZURE_TENANT_ID}\"
-       }
-     }" \
-     ${VAULT_ADDR}/v1/auth/jwt/role/dev-mi-role
+PRINCIPAL_ID=$(az identity show --name mi-vault-poc --resource-group rg-vault-poc \
+  --query principalId -o tsv)
 
-# Result: All pipelines using this managed identity share 1 entity
+az role assignment list --assignee "${PRINCIPAL_ID}" --all -o table
 ```
 
-### Test B: By Tenant
+Expect nothing at all if your pipelines fetch the token from the REST API, or exactly one Reader
+assignment scoped to the resource group holding the identity if they use `AzureCLI@2`. Anything else
+is a privilege nobody decided to grant, and you should be able to name the reason for the one that
+remains.
+
+## Test 9: the credential cannot exceed its policy
+
+**Silent**, because a credential that can do too much does everything you asked of it.
+
+Have the pipeline attempt one call its Vault role does not grant, next to one it does:
 
 ```bash
-# Create role bound to tenant (less restrictive)
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data "{
-       \"role_type\": \"jwt\",
-       \"bound_audiences\": [\"https://management.core.windows.net/\"],
-       \"user_claim\": \"sub\",
-       \"token_policies\": [\"dev-secrets-reader\"],
-       \"bound_claims\": {
-         \"tid\": \"${AZURE_TENANT_ID}\"
-       }
-     }" \
-     ${VAULT_ADDR}/v1/auth/jwt/role/tenant-role
+aws ec2 describe-regions >/dev/null && echo "permitted call succeeded"
 
-# Result: All managed identities in this tenant can authenticate
+if aws ec2 describe-instances 2>&1 | grep -q 'UnauthorizedOperation'; then
+  echo "PASS: denied what the policy does not grant"
+else
+  echo "FAIL: the credential can do more than its role allows"; exit 1
+fi
 ```
 
-### Test C: Combination (MI + Tenant)
+Both halves are needed. A denial on its own could mean the credential is broken rather than scoped.
+
+## Tests 1, 5 and 6: read the server's account, not the pipeline's
+
+A pipeline log says what the pipeline believes. The audit log says what Vault did, and it is the
+record that matters in an incident.
 
 ```bash
-# Create role with multiple bound claims
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request POST \
-     --data "{
-       \"role_type\": \"jwt\",
-       \"bound_audiences\": [\"https://management.core.windows.net/\"],
-       \"user_claim\": \"sub\",
-       \"token_policies\": [\"prod-secrets-reader\"],
-       \"bound_claims\": {
-         \"sub\": \"${PROD_MI_PRINCIPAL_ID}\",
-         \"appid\": \"${PROD_MI_CLIENT_ID}\",
-         \"tid\": \"${AZURE_TENANT_ID}\"
-       }
-     }" \
-     ${VAULT_ADDR}/v1/auth/jwt/role/prod-mi-role
-
-# Result: Only pipelines using this specific prod managed identity can authenticate
+# Per login: the policies granted, and which pipeline asked.
+jq 'select(.type=="response" and (.request.path|endswith("/login")))
+    | {policies: .auth.policies,
+       sub: .auth.metadata.pipeline_subject,
+       entity: .auth.entity_id}'
 ```
 
-## 4.7 Performance Testing
+Check that policies hold exactly one pipeline policy plus `default`, that `pipeline_subject` ends in
+the right service connection ID, and, if you set `user_claim = "tid"`, that `entity_id` is identical
+across pipelines. Different policies, different attribution, same entity is the intended result, not
+a bug.
 
-Run load test to ensure OIDC authentication performs well:
+Note that Azure DevOps masks a connection's own issuer and subject as `***` in its own logs. That is a
+display filter on the build log. Vault's audit record has the full value, which is exactly why
+attribution should be read there.
 
-File: `scripts/load-test.sh`
+## Before you call it done
 
-```bash
-#!/bin/bash
-
-ITERATIONS=100
-SUCCESS=0
-FAILED=0
-TOTAL_TIME=0
-
-echo "Running ${ITERATIONS} authentication attempts..."
-
-for i in $(seq 1 $ITERATIONS); do
-  START=$(date +%s.%N)
-  
-  # Simulate JWT authentication via curl
-  curl --silent --request POST \
-    --data "{\"jwt\": \"${JWT_TOKEN}\", \"role\": \"dev-mi-role\"}" \
-    ${VAULT_ADDR}/v1/auth/jwt/login > /dev/null 2>&1
-  
-  if [ $? -eq 0 ]; then
-    SUCCESS=$((SUCCESS + 1))
-  else
-    FAILED=$((FAILED + 1))
-  fi
-  
-  END=$(date +%s.%N)
-  DURATION=$(echo "$END - $START" | bc)
-  TOTAL_TIME=$(echo "$TOTAL_TIME + $DURATION" | bc)
-  
-  echo -ne "Progress: ${i}/${ITERATIONS} (Success: ${SUCCESS}, Failed: ${FAILED})\r"
-done
-
-echo ""
-echo "Load Test Results:"
-echo "  Total Attempts: ${ITERATIONS}"
-echo "  Successful: ${SUCCESS}"
-echo "  Failed: ${FAILED}"
-echo "  Average Time: $(echo "scale=3; ${TOTAL_TIME} / ${ITERATIONS}" | bc)s"
-```
-
-## 4.8 Audit and Compliance
-
-Enable and review audit logs:
-
-```bash
-# Enable audit logging
-vault audit enable file file_path=/vault/logs/audit.log
-
-# For HCP Vault, audit logs are available in the portal
-# Go to: Vault Cluster → Logs → Audit Logs
-
-# Query specific authentication events
-vault audit list
-
-# Review authentication patterns
-# Look for: auth/jwt/login events
-# Analyze: entity_id, aliases, policies assigned
-```
-
-## 4.9 Document Results
-
-Create a results document with:
-
-1. **Before & After Comparison**
-   - Service Principal count: 400+
-   - OIDC entity count: 10-20
-   - Client reduction: 95%+
-
-2. **Cost Savings**
-   - Monthly savings: $150+
-   - Annual savings: $1,800+
-
-3. **Performance Metrics**
-   - Authentication time: <2s
-   - Success rate: 99%+
-
-4. **Security Benefits**
-   - No long-lived credentials
-   - JWT tokens expire automatically
-   - Fine-grained access via bound claims
-   - Centralized policy management
-
-5. **Operational Improvements**
-   - Single auth method for all pipelines
-   - Easier credential rotation
-   - Simplified auditing
-
-## Next Steps
-
-Proceed to [Step 5: Production Recommendations](STEP_5_PRODUCTION.md)
+Run tests 3, 4, 7, 8 and 9 once more after your **final** configuration change. Each is silent, and
+the most likely time to break one is while fixing something else.

@@ -1,689 +1,160 @@
-# Step 5: Production Recommendations
+# Step 5: Running this in production
 
-> **Superseded, and being corrected.** This guide describes the earlier design, built on an Azure
-> Resource Manager access token. That token names only the managed identity, so it cannot tell two
-> pipelines apart, and Azure DevOps retires its issuer on 1 July 2027. The tested design is in
-> [`terraform/`](../../terraform/), and the reasoning is in [DESIGN_REVIEW.md](../DESIGN_REVIEW.md). Security
-> corrections have been applied here, but the design has not changed yet.
+> The configuration this page used to embed now lives in [`terraform/`](../../terraform/), where it is
+> applied and tested rather than transcribed. What remains here is the part Terraform cannot decide
+> for you: how to structure roles at scale, what to watch, and how to get there from where you are.
 
-## 5.1 Production Architecture
+## 5.1 How to structure roles
 
-### Recommended Bound Claims Strategy
+One role per pipeline, each bound to that pipeline's service connection subject. There is no tier
+above it worth having, and the alternatives all collapse under inspection:
 
-For your 400+ pipelines, consider this hierarchical approach:
+| Grouping | What it actually authorises |
+|---|---|
+| By business unit | Every pipeline in the unit, to everything the unit can reach |
+| By environment | Every pipeline in that environment, including the ones added tomorrow |
+| By managed identity | Every service connection behind that identity |
+| By tenant (`tid` alone) | Every workload in your tenant: virtual machines, function apps, other teams |
+| **By service connection (`sub`)** | **One pipeline** |
 
-```
-Level 1: By Business Unit / Department
-├── oidc-role: bu-retail (50 entities)
-├── oidc-role: bu-banking (40 entities)
-├── oidc-role: bu-insurance (30 entities)
-└── oidc-role: bu-corporate (20 entities)
+The grouped versions exist in older guidance because they were the only option once you had chosen an
+access token, which names the identity and nothing else. With the ID token, per-pipeline costs no more
+than per-environment: it is the same role definition with a different `bound_claims.sub`, generated in
+a loop.
 
-Level 2: By Environment
-├── oidc-role: env-production (15 entities)
-├── oidc-role: env-staging (10 entities)
-└── oidc-role: env-development (5 entities)
+What does not scale is doing it by hand. Twenty pipelines is twenty roles, twenty policies, twenty
+federated credentials, and the 20-per-identity cap means a twenty-first needs another managed
+identity. Generate them. That is what `terraform/` is for.
 
-Level 3: By Application Type
-├── oidc-role: app-web (20 entities)
-├── oidc-role: app-api (15 entities)
-└── oidc-role: app-batch (10 entities)
-```
+**Client count is not a design input.** Earlier guidance in this repository shaped roles to minimise
+Vault entities, and then recommended broad roles as the way to achieve it. That is backwards: entity
+count follows from `user_claim`, which is an independent setting. Set `user_claim = "tid"` and every
+pipeline in the tenant resolves to one entity no matter how many roles you have. Authorisation stays
+per-pipeline and attribution stays exact, because `claim_mappings` puts the full subject in every
+audit record. You are not choosing between granularity and licensing.
 
-**Total Estimated Entities**: 30-50 (vs 400+)
-**Client Reduction**: 87.5% - 92.5%
-
-## 5.2 Bound Claims Implementation Guide
-
-### Strategy 1: Tenant-Based (Simplest)
+## 5.2 Roles, at scale
 
 ```hcl
-# All managed identities in same tenant can authenticate
-resource "vault_jwt_auth_backend_role" "tenant_pipelines" {
-  backend         = vault_auth_backend.jwt.path
-  role_name       = "tenant-pipelines"
-  token_policies  = ["dev-secrets-reader"]
-  
-  role_type       = "jwt"
-  bound_audiences = ["https://management.core.windows.net/"]
-  user_claim      = "sub"
-  
-  bound_claims = {
-    tid = var.azure_tenant_id
-  }
-}
-```
+# One role per pipeline, generated rather than written.
+resource "vault_jwt_auth_backend_role" "pipeline" {
+  for_each = var.pipelines
 
-### Strategy 2: Per Managed Identity (Recommended)
+  backend   = vault_jwt_auth_backend.azdo.path
+  role_name = each.key
+  role_type = "jwt"
 
-```hcl
-# Separate roles per managed identity for environment isolation
-resource "vault_jwt_auth_backend_role" "env_production" {
-  backend         = vault_auth_backend.jwt.path
-  role_name       = "env-production"
-  token_policies  = ["prod-secrets-reader", "prod-secrets-writer"]
-  
-  role_type       = "jwt"
-  bound_audiences = ["https://management.core.windows.net/"]
-  user_claim      = "sub"
-  
-  bound_claims = {
-    sub   = var.prod_mi_principal_id
-    appid = var.prod_mi_client_id
-    tid   = var.azure_tenant_id
-  }
-  
-  token_ttl     = 1800  # 30 minutes
-  token_max_ttl = 3600  # 1 hour
-}
-```
+  bound_audiences = ["fb60f99c-7a34-4190-8149-302f77469936"]
+  bound_claims    = { sub = each.value.service_connection_subject }
 
-### Strategy 3: By Managed Identity with OID (Advanced)
+  user_claim     = "tid"
+  claim_mappings = { sub = "pipeline_subject" }
 
-```hcl
-# Use object ID (oid) claim from managed identity
-# Different managed identities for different purposes
-resource "vault_jwt_auth_backend_role" "app_team_a" {
-  backend         = vault_auth_backend.jwt.path
-  role_name       = "team-a-apps"
-  token_policies  = ["team-a-secrets"]
-  
-  role_type       = "jwt"
-  bound_audiences = ["https://management.core.windows.net/"]
-  user_claim      = "sub"
-  
-  bound_claims = {
-    sub   = var.team_a_mi_principal_id
-    appid = var.team_a_mi_client_id
-    tid   = var.azure_tenant_id
-  }
-}
-```
-
-### Strategy 4: Hybrid Approach (Best for Scale)
-
-```hcl
-# Multi-tenant with wildcard issuer (note: different from single-tenant approach)
-resource "vault_jwt_auth_backend_role" "multi_tenant" {
-  backend         = vault_auth_backend.jwt.path
-  role_name       = "multi-tenant-pipelines"
-  token_policies  = ["shared-secrets"]
-  
-  role_type       = "jwt"
-  bound_audiences = ["https://management.core.windows.net/"]
-  user_claim      = "sub"
-  
-  bound_claims_type = "glob"
-  bound_claims = {
-    # List the tenants you mean. A glob such as "https://sts.windows.net/*/" matches every tenant
-    # in the world, which means any Azure customer can authenticate to this role.
-    iss = "https://sts.windows.net/${var.partner_tenant_id}/",
-  }
-  
-  token_ttl         = 1800
-  token_bound_cidrs = ["10.0.0.0/8"]  # Azure pipeline agent network
-}
-```
-
-## 5.3 Terraform Implementation
-
-Create production-ready Terraform configuration:
-
-File: `terraform/main.tf`
-
-```hcl
-terraform {
-  required_providers {
-    vault = {
-      source  = "hashicorp/vault"
-      version = "~> 3.20"
-    }
-  }
-}
-
-provider "vault" {
-  address   = var.vault_address
-  namespace = var.vault_namespace
-  token     = var.vault_token
-}
-
-# OIDC Auth Backend
-resource "vault_jwt_auth_backend" "azdo" {
-  description        = "Azure DevOps JWT Authentication with Entra ID"
-  path              = "jwt"
-  type              = "jwt"
-  
-  oidc_discovery_url = "https://login.microsoftonline.com/${var.azure_tenant_id}/v2.0"
-  bound_issuer       = "https://sts.windows.net/${var.azure_tenant_id}/"
-
-  # No default_role: a login that names no role would otherwise get it, policies and all.
-  
-  tune {
-    default_lease_ttl = "1h"
-    max_lease_ttl     = "4h"
-  }
-}
-
-# KV Secrets Engine
-resource "vault_mount" "kv" {
-  path        = "secret"
-  type        = "kv-v2"
-  description = "KV v2 secrets engine for Azure DevOps pipelines"
-}
-
-# Policies
-resource "vault_policy" "dev_reader" {
-  name = "dev-secrets-reader"
-  
-  policy = <<EOT
-path "secret/data/dev/*" {
-  capabilities = ["read", "list"]
-}
-
-path "secret/data/shared/*" {
-  capabilities = ["read", "list"]
-}
-
-path "secret/metadata/dev/*" {
-  capabilities = ["list"]
-}
-EOT
-}
-
-resource "vault_policy" "prod_reader" {
-  name = "prod-secrets-reader"
-  
-  policy = <<EOT
-path "secret/data/prod/*" {
-  capabilities = ["read", "list"]
-}
-
-path "secret/data/shared/*" {
-  capabilities = ["read", "list"]
-}
-
-path "secret/metadata/prod/*" {
-  capabilities = ["list"]
-}
-EOT
-}
-
-# OIDC Roles - Development
-resource "vault_jwt_auth_backend_role" "dev_pipelines" {
-  backend         = vault_jwt_auth_backend.azdo.path
-  role_name       = "dev-pipelines"
-  token_policies  = [vault_policy.dev_reader.name]
-  
-  role_type       = "jwt"
-  bound_audiences = ["https://management.core.windows.net/"]
-  user_claim      = "sub"
-  
-  bound_claims = {
-    sub   = var.dev_mi_principal_id
-    appid = var.dev_mi_client_id
-    tid   = var.azure_tenant_id
-  }
-  
-  token_ttl       = 3600
-  token_max_ttl   = 7200
-}
-
-# OIDC Roles - Production
-resource "vault_jwt_auth_backend_role" "prod_pipelines" {
-  backend         = vault_jwt_auth_backend.azdo.path
-  role_name       = "prod-pipelines"
-  token_policies  = [vault_policy.prod_reader.name]
-  
-  role_type       = "jwt"
-  bound_audiences = ["https://management.core.windows.net/"]
-  user_claim      = "sub"
-  
-  bound_claims = {
-    sub   = var.prod_mi_principal_id
-    appid = var.prod_mi_client_id
-    tid   = var.azure_tenant_id
-  }
-  
-  token_ttl       = 1800
-  token_max_ttl   = 3600
-}
-
-# Sample secrets
-resource "vault_kv_secret_v2" "dev_config" {
-  mount               = vault_mount.kv.path
-  name                = "dev/app-config"
-  cas                 = 1
-  delete_all_versions = true
-  
-  data_json = jsonencode({
-    database_url = "postgresql://dev-db:5432/myapp"
-    api_key      = "dev-api-key-12345"
-    environment  = "development"
-  })
-}
-
-resource "vault_kv_secret_v2" "prod_config" {
-  mount               = vault_mount.kv.path
-  name                = "prod/app-config"
-  cas                 = 1
-  delete_all_versions = true
-  
-  data_json = jsonencode({
-    database_url = "postgresql://prod-db:5432/myapp"
-    api_key      = "prod-api-key-67890"
-    environment  = "production"
-  })
-}
-```
-
-File: `terraform/variables.tf`
-
-```hcl
-variable "vault_address" {
-  description = "HCP Vault cluster address"
-  type        = string
-}
-
-variable "vault_namespace" {
-  description = "Vault namespace"
-  type        = string
-  default     = "admin"
-}
-
-variable "vault_token" {
-  description = "Vault admin token"
-  type        = string
-  sensitive   = true
-}
-
-variable "azure_tenant_id" {
-  description = "Azure Tenant ID for Entra ID OAuth"
-  type        = string
-}
-
-variable "dev_mi_principal_id" {
-  description = "Dev managed identity principal (object) ID"
-  type        = string
-}
-
-variable "dev_mi_client_id" {
-  description = "Dev managed identity client (application) ID"
-  type        = string
-}
-
-variable "prod_mi_principal_id" {
-  description = "Prod managed identity principal (object) ID"
-  type        = string
-}
-
-variable "prod_mi_client_id" {
-  description = "Prod managed identity client (application) ID"
-  type        = string
-}
-```
-
-File: `terraform/outputs.tf`
-
-```hcl
-output "oidc_auth_path" {
-  description = "Path to OIDC auth backend"
-  value       = vault_jwt_auth_backend.azdo.path
-}
-
-output "oidc_roles" {
-  description = "Created OIDC roles"
-  value = {
-    dev  = vault_jwt_auth_backend_role.dev_pipelines.role_name
-    prod = vault_jwt_auth_backend_role.prod_pipelines.role_name
-  }
-}
-
-output "policies" {
-  description = "Created policies"
-  value = {
-    dev  = vault_policy.dev_reader.name
-    prod = vault_policy.prod_reader.name
-  }
-}
-```
-
-Apply Terraform:
-```bash
-cd terraform
-terraform init
-terraform plan
-terraform apply
-```
-
-## 5.4 Azure DevOps Pipeline Template
-
-Create reusable pipeline template:
-
-File: `templates/vault-integration.yml`
-
-```yaml
-parameters:
-  - name: vaultAddr
-    type: string
-  - name: vaultNamespace
-    type: string
-  - name: oidcRole
-    type: string
-  - name: secretPath
-    type: string
-
-steps:
-  - task: AzureCLI@2
-    displayName: 'Get Access Token'
-    inputs:
-      azureSubscription: '$(azureServiceConnection)'
-      scriptType: 'bash'
-      scriptLocation: 'inlineScript'
-      inlineScript: |
-        # Get access token with Azure Resource Manager audience
-        TOKEN=$(az account get-access-token \
-          --resource https://management.core.windows.net/ \
-          --query accessToken -o tsv)
-        
-        echo "##vso[task.setvariable variable=ACCESS_TOKEN;issecret=true]${TOKEN}"
-
-  - task: Bash@3
-    displayName: 'Authenticate to Vault'
-    env:
-      VAULT_ADDR: ${{ parameters.vaultAddr }}
-      VAULT_NAMESPACE: ${{ parameters.vaultNamespace }}
-      ACCESS_TOKEN: $(ACCESS_TOKEN)
-    inputs:
-      targetType: 'inline'
-      script: |
-        AUTH_RESPONSE=$(curl --silent --request POST \
-          --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-          --data "{\"jwt\": \"${ACCESS_TOKEN}\", \"role\": \"${{ parameters.oidcRole }}\"}" \
-          ${VAULT_ADDR}/v1/auth/jwt/login)
-        
-        VAULT_TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.auth.client_token')
-        
-        if [ -z "$VAULT_TOKEN" ] || [ "$VAULT_TOKEN" = "null" ]; then
-          echo "Error: Failed to authenticate to Vault"
-          # Print the errors, not the body. A body that reached here because jq or the
-          # response shape changed, rather than because the login failed, still holds a
-          # usable client_token.
-          echo "$AUTH_RESPONSE" | jq -r '.errors[]? // "no error detail returned"'
-          exit 1
-        fi
-        
-        # No isOutput. A secret passed as a job output variable is not masked in the job
-        # that consumes it, and a Vault token that crosses a job boundary lives longer
-        # than the work it was minted for. Keep it inside this job.
-        echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true]${VAULT_TOKEN}"
-
-  - task: Bash@3
-    displayName: 'Retrieve Secrets'
-    env:
-      VAULT_ADDR: ${{ parameters.vaultAddr }}
-      VAULT_NAMESPACE: ${{ parameters.vaultNamespace }}
-      VAULT_TOKEN: $(VAULT_TOKEN)
-    inputs:
-      targetType: 'inline'
-      script: |
-        # Read secrets using curl
-        SECRET_DATA=$(curl --silent \
-          --header "X-Vault-Token: ${VAULT_TOKEN}" \
-          --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-          ${VAULT_ADDR}/v1/${{ parameters.secretPath }})
-        
-        # Export each key as a masked pipeline variable
-        echo "$SECRET_DATA" | jq -r '.data.data | to_entries[] | "##vso[task.setvariable variable=\(.key);issecret=true]\(.value)"'
-```
-
-Use the template in pipelines:
-
-File: `azure-pipelines-prod.yml`
-
-```yaml
-trigger:
-  branches:
-    include:
-      - main
-
-pool:
-  vmImage: 'ubuntu-latest'
-
-variables:
-  - group: vault-config  # Variable group with Vault settings
-
-stages:
-  - stage: Deploy
-    jobs:
-      - job: DeployApp
-        steps:
-          - template: templates/vault-integration.yml
-            parameters:
-              vaultAddr: $(VAULT_ADDR)
-              vaultNamespace: $(VAULT_NAMESPACE)
-              oidcRole: 'prod-pipelines'
-              secretPath: 'secret/prod/app-config'
-          
-          - task: Bash@3
-            displayName: 'Deploy Application'
-            env:
-              DATABASE_URL: $(database_url)
-              API_KEY: $(api_key)
-            inputs:
-              targetType: 'inline'
-              script: |
-                echo "Deploying with secrets from Vault..."
-                # Your deployment logic here
-```
-
-## 5.5 Security Best Practices
-
-### 1. Token TTL Configuration
-
-```hcl
-resource "vault_jwt_auth_backend_role" "secure_role" {
-  # Short-lived tokens
-  token_ttl       = 1800   # 30 minutes
-  token_max_ttl   = 3600   # 1 hour
-  
-  # Leave the default policy attached. It is what grants auth/token/revoke-self, so
-  # dropping it takes away the pipeline's ability to hand the token back when it is
-  # finished, and the token then lives out its full TTL.
+  token_policies          = [vault_policy.pipeline[each.key].name]
+  token_ttl               = "5m"
+  token_max_ttl           = "5m"
+  token_num_uses          = 2
   token_no_default_policy = false
-
-  # Limit token usage. Count the calls first: login itself does not consume a use, but
-  # every read does, and a token that revokes itself needs one use for the revoke.
-  token_num_uses = 2
 }
 ```
 
-### 2. Network Restrictions
+See [`terraform/vault.tf`](../../terraform/vault.tf) for the version that runs, including the AWS
+secrets engine and the preconditions that stop a bad apply early.
 
-```hcl
-resource "vault_jwt_auth_backend_role" "network_restricted" {
-  # Restrict to Azure DevOps agent IP ranges
-  token_bound_cidrs = [
-    "20.0.0.0/8",     # Azure DevOps agents
-    "40.0.0.0/8",     # Azure DevOps agents
-    "your-vpn-cidr"   # Your corporate VPN
-  ]
-}
-```
+## 5.3 What is worth restricting, and what is theatre
 
-### 3. Audit Everything
+**Token TTL.** Minutes. The token exists to fetch a credential and hand it back. An hour is not a
+short-lived credential, it is a credential you have stopped thinking about.
 
-```bash
-# Enable audit logging
-vault audit enable file \
-  file_path=/vault/logs/audit.log \
-  log_raw=false \
-  format=json
+**Token uses.** `token_num_uses = 2`: one read, one `revoke-self`. Count before you set it; login does
+not consume a use, and a token that runs out mid-job fails at the revoke, where nobody is looking.
 
-# For HCP Vault, audit logs are automatic
-# Access via: Portal → Vault Cluster → Logs
-```
+**The default policy.** Leave it attached. `token_no_default_policy = true` removes `revoke-self`,
+which silently converts every credential into one that lives its full TTL.
 
-### 4. Least Privilege Policies
+**`token_bound_cidrs`** is worth less than it looks for Microsoft-hosted agents. Their address ranges
+are large, shared with other tenants, and published as a changing list, so pinning `20.0.0.0/8` tells
+you "some Azure host" and costs you an outage the day the list changes. It is worth real money for
+self-hosted agents on known egress addresses, where it is a genuine second factor.
 
-```hcl
-# Bad: Too permissive
-path "secret/*" {
-  capabilities = ["read", "list", "create", "update", "delete"]
-}
+**Branch and template restrictions** cannot come from Vault: the token contains no branch and no
+repository. They come from Azure DevOps, as checks on the service connection, evaluated before a token
+is minted:
 
-# Good: Specific and limited
-path "secret/data/prod/app-name/*" {
-  capabilities = ["read"]
-}
+- **Branch control**: the connection is usable only from named branches, optionally only when branch
+  protection is on.
+- **Required template**: the pipeline must extend a template you control, so your steps run first.
+- **Per-pipeline authorisation**: never "grant access to all pipelines".
 
-path "secret/metadata/prod/app-name/*" {
-  capabilities = ["list"]
-}
-```
+Say clearly which enforcement point does what. A reviewer who believes Vault is checking the branch
+will be unpleasantly surprised.
 
-### 5. Rotation Strategy
+## 5.4 What to monitor
+
+Not client count. Three things that indicate whether the design is holding:
+
+**Credentials that outlive their job.** The one number that matters. If revocation is working, the gap
+between a lease being created and destroyed is tens of seconds. Alert on leases that reach their TTL
+instead of being revoked, since that means an `EXIT` trap is missing or a token ran out of uses.
 
 ```bash
-# Rotate secrets regularly
-vault kv put secret/prod/app-config \
-  database_url="new-connection-string" \
-  api_key="new-api-key" \
-  environment="production"
-
-# Use Vault's dynamic secrets where possible
-vault secrets enable database
-
-vault write database/config/myapp \
-  plugin_name=postgresql-database-plugin \
-  connection_url="postgresql://{{username}}:{{password}}@postgres:5432/myapp" \
-  allowed_roles="prod-role" \
-  username="vault" \
-  password="vault-password"
+# Dynamic IAM users that exist right now. In steady state this is empty
+# between runs, and holds one entry per running job during them.
+aws iam list-users --query "Users[?starts_with(UserName, 'vault-')].UserName"
 ```
 
-## 5.6 Monitoring and Alerting
+**Refused logins.** A pipeline that offers a token to the wrong role, a subject that changed because a
+connection was recreated, or a token whose audience does not match. Each is a `permission denied` in
+the audit log with the role name attached.
 
-### Client Count Monitoring
+**Requests by pipeline.** From `claim_mappings`, every audit record carries `pipeline_subject`. That
+answers "which pipeline read that secret", which is the question asked after an incident, and the one
+that matters most.
 
 ```bash
-# Create script to monitor client count
-#!/bin/bash
-
-THRESHOLD=100
-CURRENT_COUNT=$(vault read -field=clients sys/internal/counters/activity/monthly)
-
-if [ ${CURRENT_COUNT} -gt ${THRESHOLD} ]; then
-  echo "Alert: Client count (${CURRENT_COUNT}) exceeds threshold (${THRESHOLD})"
-  # Send alert to monitoring system
-fi
+# HCP streams audit logs to your log destination. Filter on the mount, and
+# read the subject from the token metadata.
+jq 'select(.request.path | startswith("auth/azdo-jwt/login"))
+    | {time, path: .request.path, sub: .auth.metadata.pipeline_subject, policies: .auth.policies}'
 ```
 
-### Key Metrics to Track
+[`demo/watch-audit.sh`](../../demo/watch-audit.sh) and [`demo/watch-iam.sh`](../../demo/watch-iam.sh)
+are working versions of the first and third.
 
-1. **Active Clients**: Monthly unique entities
-2. **Authentication Rate**: Logins per hour
-3. **Token Usage**: Average token lifetime
-4. **Policy Violations**: Failed auth attempts
-5. **Secret Access**: Read operations per secret
+## 5.5 Getting there from a pipeline that has a stored secret
 
-## 5.7 Migration Plan
+The order matters, because the last step is the only one that removes risk.
 
-### Phase 1: Pilot (Weeks 1-2)
-- Select 5-10 non-critical pipelines
-- Implement OIDC authentication
-- Validate functionality
-- Gather metrics
+1. **One pipeline, non-critical.** Add the service connection, the federated credential, one role, one
+   policy. Leave the existing secret in place and unused.
+2. **Prove the negative.** Point that pipeline at another pipeline's role and confirm it is refused.
+   If it succeeds, your `bound_claims` is not doing what you think, and everything after this is
+   built on sand.
+3. **Prove revocation.** After the job, confirm the credential no longer works. `InvalidClientTokenId`
+   from AWS, or a `permission denied` from Vault.
+4. **Widen to a team**, generating roles rather than writing them.
+5. **Delete the stored secrets.** Until this happens you have added a mechanism, not removed a
+   credential, and the old one is still the shortest path in for anyone who finds it.
+6. **Remove the standing identities** the old design needed, including service principals created per
+   pipeline, and any role assignment the new one does not require.
 
-### Phase 2: Dev/Test (Weeks 3-4)
-- Migrate all development pipelines
-- Monitor client count reduction
-- Fine-tune bound claims
-- Update documentation
+Step 5 is the one that gets skipped. Put a date on it.
 
-### Phase 3: Production (Weeks 5-8)
-- Migrate production pipelines in batches
-- 24/7 monitoring
-- Rollback plan ready
-- Post-migration validation
+## 5.6 When it does not work
 
-### Phase 4: Cleanup (Week 9)
-- Decommission service principals
-- Finalize cost savings report
-- Update runbooks
-- Team training
+| Symptom | Cause |
+|---|---|
+| `audience mismatch` on every login | Role bound to `api://AzureADTokenExchange` rather than the GUID the token carries |
+| `claim "sub" does not match` | Subject copied with a prefix trimmed, or the service connection was recreated and its ID changed |
+| Login succeeds, read denied | Policy path does not match the mount path, or KV v2 needs `secret/data/...` rather than `secret/...` |
+| Revoke fails, everything else works | `token_no_default_policy` is true, or `token_num_uses` was exhausted before the revoke |
+| `AccessDenied` on `CreateUser` from Vault | Missing `username_template` or `permissions_boundary_arn`, in an account that constrains IAM user creation |
+| `There is no explicit reference to service connection` | Using the REST token method without the `condition: false` task that declares the connection |
+| Pipeline queues forever, no error | No parallel job available in the organisation |
 
-## 5.8 Troubleshooting Guide
+More in [COMMON_PITFALLS.md](../COMMON_PITFALLS.md).
 
-### Issue 1: Authentication Failures
+## Next steps
 
-```bash
-# Check JWT configuration
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/auth/jwt/config | jq
-
-# Verify role configuration
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/auth/jwt/role/your-role | jq
-
-# Test with verbose output - decode JWT token first
-echo "${JWT_TOKEN}" | cut -d'.' -f2 | base64 -d | jq
-
-# Check if issuer matches
-# JWT iss claim should match bound_issuer in JWT config
-# Expected for access tokens: https://sts.windows.net/<tenant-id>/
-```
-
-### Issue 2: Client Count Not Reducing
-
-```bash
-# List all entities
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     --request LIST \
-     ${VAULT_ADDR}/v1/identity/entity/id | jq
-
-# Check entity aliases (should see multiple aliases per entity if working)
-ENTITY_ID="your-entity-id"
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/identity/entity/id/${ENTITY_ID} | jq '.data.aliases'
-
-# Verify bound claims are working
-curl --header "X-Vault-Token: ${VAULT_TOKEN}" \
-     --header "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-     ${VAULT_ADDR}/v1/auth/jwt/role/your-role | jq '.data.bound_claims'
-
-# Expected: Multiple aliases per entity
-# If each pipeline creates new entity, bound_claims aren't matching
-# Verify JWT issuer: https://sts.windows.net/<tenant-id>/
-```
-
-### Issue 3: Permission Denied
-
-```bash
-# Check assigned policies
-vault token lookup
-
-# Verify policy contents
-vault policy read your-policy
-
-# Test policy
-vault policy test your-policy secret/data/prod/app-config
-```
-
-## 5.9 Success Criteria
-
-✅ **Client Count Reduction**: 85%+ reduction from baseline
-✅ **Cost Savings**: $1,500+ annual savings
-✅ **Authentication Success**: 99%+ success rate
-✅ **Performance**: <3s authentication time
-✅ **Security**: No exposed credentials, short-lived tokens
-✅ **Operational**: Simplified credential management
-
-## Next Steps
-
-- Review [Common Pitfalls](../COMMON_PITFALLS.md)
-- Explore [Advanced Configurations](samples/AZDO-HashiCorp-Vault-EntraID-OIDC-Advanced-config-and-troubleshooting.md)
-- Join HashiCorp Community for support
+[Step 4: Testing](STEP_4_TESTING.md) has the acceptance tests, including the two in 5.5 above that are
+worth running before you trust any of this.

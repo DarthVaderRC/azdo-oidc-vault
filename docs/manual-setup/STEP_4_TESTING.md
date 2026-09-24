@@ -1,13 +1,10 @@
 # Step 4: Testing
 
-> These are the nine tests the tested build was measured against. Results from a live run are in
-> [VALIDATION.md](../VALIDATION.md); this page is how to run them yourself.
+> These are the nine tests the tested build was measured against. Results from a live run are in [VALIDATION.md](../VALIDATION.md); this page is how to run them yourself.
 
-The old version of this page measured whether Vault's client count went down. That is a licensing
-question, not a security one, and it told you nothing about whether the design worked. These nine do.
+The old version of this page measured whether Vault's client count went down. That is a licensing question, not a security one, and it told you nothing about whether the design worked. These nine do.
 
-Four of them can fail while everything still looks healthy. Those are marked **silent**, and they are
-the reason to run this list rather than trusting a green pipeline.
+Four of them can fail while everything still looks healthy. Those are marked **silent**, and they are the reason to run this list rather than trusting a green pipeline.
 
 ## The list
 
@@ -44,15 +41,11 @@ aws iam list-users --query "Users[?contains(UserName,'vault-')].UserName"
 # empty between runs
 ```
 
-AWS is eventually consistent, so allow a few seconds and retry rather than concluding on the first
-answer. If the user still exists minutes later, revocation did not happen: check that the `EXIT` trap
-is installed before the first thing that can fail, that `token_no_default_policy` is false, and that
-`token_num_uses` left a use for the revoke.
+AWS is eventually consistent, so allow a few seconds and retry rather than concluding on the first answer. If the user still exists minutes later, revocation did not happen: check that the `EXIT` trap is installed before the first thing that can fail, that `token_no_default_policy` is false, and that `token_num_uses` left a use for the revoke.
 
 ## Test 4: one pipeline cannot use another's role
 
-**Silent, and the most important test on this page.** If this fails, every other test still passes
-and you have per-pipeline roles that are not actually per-pipeline.
+**Silent, and the most important test on this page.** If this fails, every other test still passes and you have per-pipeline roles that are not actually per-pipeline.
 
 Add a step to pipeline B that offers its own token to pipeline A's role:
 
@@ -75,13 +68,11 @@ else
 fi
 ```
 
-The guard matters more than the assertion. A misspelled role name also produces a non-200, so a test
-that accepts any failure reports PASS while proving nothing. Read the reason, not the status.
+The guard matters more than the assertion. A misspelled role name also produces a non-200, so a test that accepts any failure reports PASS while proving nothing. Read the reason, not the status.
 
 ## Test 7: no credential reaches the logs
 
-**Silent.** Nothing fails when a token is printed; you simply have a token in a log with a long
-retention period.
+**Silent.** Nothing fails when a token is printed; you simply have a token in a log with a long retention period.
 
 Download every log part of a run and search it. Counts only, never the matched text:
 
@@ -96,11 +87,9 @@ curl -sS -u ":${AZDO_PAT}" \
   | grep -cE 'hvs\.|A[KS]IA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{20,}'
 ```
 
-Expect `0`. [`demo/scan-logs.sh`](../../demo/scan-logs.sh) does this across every pipeline's latest
-run.
+Expect `0`. [`demo/scan-logs.sh`](../../demo/scan-logs.sh) does this across every pipeline's latest run.
 
-Run it against your **most verbose** build, not a quiet one. A debug step added for an afternoon and
-removed is still in that run's logs, and those logs outlive the step.
+Run it against your **most verbose** build, not a quiet one. A debug step added for an afternoon and removed is still in that run's logs, and those logs outlive the step.
 
 ## Test 8: no unneeded standing privilege
 
@@ -113,10 +102,7 @@ PRINCIPAL_ID=$(az identity show --name mi-vault-poc --resource-group rg-vault-po
 az role assignment list --assignee "${PRINCIPAL_ID}" --all -o table
 ```
 
-Expect nothing at all if your pipelines fetch the token from the REST API, or exactly one Reader
-assignment scoped to the resource group holding the identity if they use `AzureCLI@2`. Anything else
-is a privilege nobody decided to grant, and you should be able to name the reason for the one that
-remains.
+Expect nothing at all if your pipelines fetch the token from the REST API, or exactly one Reader assignment scoped to the resource group holding the identity if they use `AzureCLI@2`. Anything else is a privilege nobody decided to grant, and you should be able to name the reason for the one that remains.
 
 ## Test 9: the credential cannot exceed its policy
 
@@ -138,8 +124,7 @@ Both halves are needed. A denial on its own could mean the credential is broken 
 
 ## Tests 1, 5 and 6: read the server's account, not the pipeline's
 
-A pipeline log says what the pipeline believes. The audit log says what Vault did, and it is the
-record that matters in an incident.
+A pipeline log says what the pipeline believes. The audit log says what Vault did, and it is the record that matters in an incident.
 
 ```bash
 # Per login: the policies granted, and which pipeline asked.
@@ -149,16 +134,10 @@ jq 'select(.type=="response" and (.request.path|endswith("/login")))
        entity: .auth.entity_id}'
 ```
 
-Check that policies hold exactly one pipeline policy plus `default`, that `pipeline_subject` ends in
-the right service connection ID, and, if you set `user_claim = "tid"`, that `entity_id` is identical
-across pipelines. Different policies, different attribution, same entity is the intended result, not
-a bug.
+Check that policies hold exactly one pipeline policy plus `default`, that `pipeline_subject` ends in the right service connection ID, and, if you set `user_claim = "tid"`, that `entity_id` is identical across pipelines. Different policies, different attribution, same entity is the intended result, not a bug.
 
-Note that Azure DevOps masks a connection's own issuer and subject as `***` in its own logs. That is a
-display filter on the build log. Vault's audit record has the full value, which is exactly why
-attribution should be read there.
+Note that Azure DevOps masks a connection's own issuer and subject as `***` in its own logs. That is a display filter on the build log. Vault's audit record has the full value, which is exactly why attribution should be read there.
 
 ## Before you call it done
 
-Run tests 3, 4, 7, 8 and 9 once more after your **final** configuration change. Each is silent, and
-the most likely time to break one is while fixing something else.
+Run tests 3, 4, 7, 8 and 9 once more after your **final** configuration change. Each is silent, and the most likely time to break one is while fixing something else.

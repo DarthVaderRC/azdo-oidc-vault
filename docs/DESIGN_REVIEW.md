@@ -1,8 +1,6 @@
 # Design review: why the guidance in this repository changed
 
-**Reviewed:** 11 to 16 September 2026.
-**Subject:** the earlier version of this repository, which showed Azure DevOps pipelines authenticating to Vault with an Azure Resource Manager access token.
-**Requirement under test:** move from long-standing, pipeline-wide service principal privileges to a zero standing privileges model, with just-in-time access granted at the task level rather than for the whole pipeline.
+**Reviewed:** 11 to 16 September 2026. **Subject:** the earlier version of this repository, which showed Azure DevOps pipelines authenticating to Vault with an Azure Resource Manager access token. **Requirement under test:** move from long-standing, pipeline-wide service principal privileges to a zero standing privileges model, with just-in-time access granted at the task level rather than for the whole pipeline.
 
 This is the report that led to the rewrite. The earlier design proved credential-free authentication, which is real and worth having, but it did not demonstrate zero standing privileges, and on task-level scoping it demonstrated the opposite of what was asked. The findings below explain why, and what replaced it.
 
@@ -365,12 +363,6 @@ Three things the build settled that this report left open:
 - **The OidcToken REST API and `AzureCLI@2` return the same token**, byte for byte, with the same `uti`. The choice between them is about which failure mode and which Azure permission you prefer, not about the token.
 - **The backing identity can hold no Azure role assignment at all**, provided the pipeline uses the REST method. `AzureCLI@2` needs one, because it selects a subscription.
 
-Some of the files cited above no longer exist. `azure-pipeline.yml`, `WORKING_EXAMPLE.md`,
-`DIAGRAMS.md`, `policy.hcl`, `bound-claims.json`, `samples/vault-config-using-terraform.md` and
-`samples/azure-pipelines-vault.yml` were withdrawn on 23 September 2026 rather than corrected: each one taught the access-token design end to
-end, and a half-corrected copy is worse than none. The advanced document cited above survived, rewritten:
-it is now [`manual-setup/ADVANCED_CONFIG.md`](manual-setup/ADVANCED_CONFIG.md), and it no longer says any
-of what this report quotes it as saying. The line references in this report are to the repository
-as it stood when the review was written, and git history still holds every one of them.
+Some of the files cited above no longer exist. `azure-pipeline.yml`, `WORKING_EXAMPLE.md`, `DIAGRAMS.md`, `policy.hcl`, `bound-claims.json`, `samples/vault-config-using-terraform.md` and `samples/azure-pipelines-vault.yml` were withdrawn on 23 September 2026 rather than corrected: each one taught the access-token design end to end, and a half-corrected copy is worse than none. The advanced document cited above survived, rewritten: it is now [`manual-setup/ADVANCED_CONFIG.md`](manual-setup/ADVANCED_CONFIG.md), and it no longer says any of what this report quotes it as saying. The line references in this report are to the repository as it stood when the review was written, and git history still holds every one of them.
 
 One constraint found while resolving the plugin federation question deserves early attention: plugin workload identity federation requires **AWS to reach Vault's own OIDC issuer endpoint** to fetch its JWKS. A private Vault cluster cannot satisfy this, and a public one advertises a port, which AWS documentation says an OIDC provider URL should not contain.

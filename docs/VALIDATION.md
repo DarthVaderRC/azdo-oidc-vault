@@ -179,10 +179,7 @@ To fall back:
 terraform apply -parallelism=1 -var token_method=rest -var grant_identity_reader=false
 ```
 
-That fallback was run end to end on 23 September 2026, build 95: with the role assignment destroyed and
-`az role assignment list --assignee <identity> --all` returning nothing at all, the pipeline still
-authenticated, still had its sibling's role refuse it, and still obtained and revoked an AWS credential.
-The claims were the same as the `azurecli` run minutes earlier, so the choice really is only about cost.
+That fallback was run end to end on 23 September 2026, build 95: with the role assignment destroyed and `az role assignment list --assignee <identity> --all` returning nothing at all, the pipeline still authenticated, still had its sibling's role refuse it, and still obtained and revoked an AWS credential. The claims were the same as the `azurecli` run minutes earlier, so the choice really is only about cost.
 
 The `rest` path needs that skipped task because the OidcToken API refuses a connection the job has not referenced: *"There is no explicit reference to service connection ... from current stage."* The authorised set is computed from task inputs when the job is queued, so a task that never executes still declares it.
 

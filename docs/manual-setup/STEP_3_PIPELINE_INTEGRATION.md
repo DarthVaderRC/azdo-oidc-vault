@@ -1,8 +1,6 @@
 # Step 3: The pipeline
 
-> The tested version of everything below is [`pipelines/vault-zsp.sh`](../../pipelines/vault-zsp.sh)
-> and [`pipelines/pipeline.yml.tftpl`](../../pipelines/pipeline.yml.tftpl). This page explains the
-> shape so you can write your own, rather than restating a worse copy of it.
+> The tested version of everything below is [`pipelines/vault-zsp.sh`](../../pipelines/vault-zsp.sh) and [`pipelines/pipeline.yml.tftpl`](../../pipelines/pipeline.yml.tftpl). This page explains the shape so you can write your own, rather than restating a worse copy of it.
 
 ## 3.1 The shape
 
@@ -14,12 +12,9 @@ Five things happen, in this order, **inside one task**:
 4. Do the work.
 5. Give the credential back.
 
-Step 5 is the one that is usually missing, and it is the one that turns "short-lived" from a claim
-into a fact. Everything else is plumbing.
+Step 5 is the one that is usually missing, and it is the one that turns "short-lived" from a claim into a fact. Everything else is plumbing.
 
-**Inside one task** is not a stylistic preference. The moment you write the Vault token to a pipeline
-variable, it stops belonging to the task that earned it and becomes readable by every later step in
-the job. One task's privilege becomes the whole job's privilege, for the rest of the job.
+**Inside one task** is not a stylistic preference. The moment you write the Vault token to a pipeline variable, it stops belonging to the task that earned it and becomes readable by every later step in the job. One task's privilege becomes the whole job's privilege, for the rest of the job.
 
 ## 3.2 Getting the ID token
 
@@ -40,8 +35,7 @@ Either method returns the same token. Step 1 covers the Azure permission each on
       # ... the rest of this section ...
 ```
 
-Note the task also runs `az login` and `az account set` before your script. That is where it fails if
-the identity holds no role assignment, and the error names the subscription rather than the cause.
+Note the task also runs `az login` and `az account set` before your script. That is where it fails if the identity holds no role assignment, and the error names the subscription rather than the cause.
 
 **With the OidcToken REST API.** No Azure permission at all:
 
@@ -74,9 +68,7 @@ the identity holds no role assignment, and the error names the subscription rath
       fi
 ```
 
-The task that never runs is not decoration. The set of connections a job may use is computed from
-task inputs when the job is queued, so a task with `condition: false` still declares it. Without it:
-*"There is no explicit reference to service connection ... from current stage."*
+The task that never runs is not decoration. The set of connections a job may use is computed from task inputs when the job is queued, so a task with `condition: false` still declares it. Without it: *"There is no explicit reference to service connection ... from current stage."*
 
 ## 3.3 Authenticating to Vault
 
@@ -97,9 +89,7 @@ if [ -z "${VAULT_TOKEN}" ]; then
 fi
 ```
 
-Each pipeline names **its own role**. A pipeline that names a sibling's role is refused, because the
-subject in its token does not match that role's `bound_subject`. That refusal is worth testing
-deliberately, and Step 4 does.
+Each pipeline names **its own role**. A pipeline that names a sibling's role is refused, because the subject in its token does not match that role's `bound_subject`. That refusal is worth testing deliberately, and Step 4 does.
 
 ## 3.4 Giving the credential back
 
@@ -119,24 +109,17 @@ trap revoke EXIT
 
 `revoke-self` returns **204 with no body**. Do not pipe it to `jq` expecting JSON.
 
-Revoking the Vault token also revokes every lease it created, so a dynamic AWS credential obtained
-with it is destroyed at the same moment. Seconds later, AWS answers `InvalidClientTokenId` to anything
-that tries to use it.
+Revoking the Vault token also revokes every lease it created, so a dynamic AWS credential obtained with it is destroyed at the same moment. Seconds later, AWS answers `InvalidClientTokenId` to anything that tries to use it.
 
 Three things make this reliable:
 
 - **`trap ... EXIT`**, not a line at the end of the script, so it runs when the work fails too.
-- **The `default` policy stays attached.** That is what grants `auth/token/revoke-self`. Setting
-  `token_no_default_policy = true` takes revocation away and guarantees the credential lives its full
-  TTL, which is the opposite of the intent.
-- **A short TTL underneath it.** Revocation is the fast path, not the only one: if the agent is
-  destroyed mid-job, the five-minute lease expires by itself.
+- **The `default` policy stays attached.** That is what grants `auth/token/revoke-self`. Setting `token_no_default_policy = true` takes revocation away and guarantees the credential lives its full TTL, which is the opposite of the intent.
+- **A short TTL underneath it.** Revocation is the fast path, not the only one: if the agent is destroyed mid-job, the five-minute lease expires by itself.
 
 ## 3.5 Counting token uses
 
-If you set `token_num_uses`, count carefully. Login does not consume a use; each subsequent request
-does, and revocation is a request. Reading one secret and then revoking needs `token_num_uses=2`. Get
-this wrong and the failure arrives at the revoke, which is exactly where you stop watching.
+If you set `token_num_uses`, count carefully. Login does not consume a use; each subsequent request does, and revocation is a request. Reading one secret and then revoking needs `token_num_uses=2`. Get this wrong and the failure arrives at the revoke, which is exactly where you stop watching.
 
 ## 3.6 What not to do
 
@@ -191,9 +174,7 @@ steps:
         # ... use $SECRET here, in this task, without exporting it ...
 ```
 
-For the version with dynamic AWS credentials, the negative test and the proof that revocation worked,
-read [`pipelines/vault-zsp.sh`](../../pipelines/vault-zsp.sh). It is the script the acceptance tests
-in [VALIDATION.md](../VALIDATION.md) were run against.
+For the version with dynamic AWS credentials, the negative test and the proof that revocation worked, read [`pipelines/vault-zsp.sh`](../../pipelines/vault-zsp.sh). It is the script the acceptance tests in [VALIDATION.md](../VALIDATION.md) were run against.
 
 ## Next steps
 

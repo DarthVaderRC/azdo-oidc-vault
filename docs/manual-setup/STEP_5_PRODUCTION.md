@@ -158,3 +158,7 @@ More in [COMMON_PITFALLS.md](../COMMON_PITFALLS.md).
 
 [Step 4: Testing](STEP_4_TESTING.md) has the acceptance tests, including the two in 5.5 above that are
 worth running before you trust any of this.
+
+[ADVANCED_CONFIG.md](ADVANCED_CONFIG.md) covers what changes past twenty pipelines: separating
+environments, choosing a token method for the whole organisation, hardening the AWS secrets engine,
+and exactly which system enforces which control.

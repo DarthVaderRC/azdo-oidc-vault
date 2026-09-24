@@ -86,7 +86,7 @@ Four mechanisms, each of which alone defeats task-level scoping.
 
 **The reusable template makes it worse.** It uses `isOutput=true` (`STEP_5_PRODUCTION.md:403`), extending the token's reach across jobs in the stage. Any team adopting the template inherits the widest possible scope by default.
 
-**Most fundamentally, the token has no task dimension.** Claims are `sub`, `oid`, `appid` and `tid`, all identifying the managed identity and nothing else. The repository's own advanced document states this correctly and explicitly, listing binding to a service connection, repository or branch as "NOT POSSIBLE" (`samples/AZDO-HashiCorp-Vault-EntraID-OIDC-Advanced-config-and-troubleshooting.md:104`). Vault cannot make a task-level authorisation decision on a token that contains no task.
+**Most fundamentally, the token has no task dimension.** Claims are `sub`, `oid`, `appid` and `tid`, all identifying the managed identity and nothing else. The repository's own advanced document stated this correctly and explicitly, listing binding to a service connection, repository or branch as "NOT POSSIBLE". Vault cannot make a task-level authorisation decision on a token that contains no task.
 
 Compounding this, `STEP_3_PIPELINE_INTEGRATION.md:47` instructs the reader to tick "Grant access to all pipelines" on the service connection. For anyone pursuing least privilege that is precisely backwards.
 
@@ -269,7 +269,7 @@ This is now confirmed rather than assumed. The OidcToken Create API accepts only
 
 #### Service connections map many-to-one onto identities
 
-**Several service connections can share a single app registration or user-assigned managed identity.** This is not an edge case; it is the default outcome of how teams create connections, and the repository already documents it at `samples/AZDO-HashiCorp-Vault-EntraID-OIDC-Advanced-config-and-troubleshooting.md:104`.
+**Several service connections can share a single app registration or user-assigned managed identity.** This is not an edge case; it is the default outcome of how teams create connections, and the repository's advanced document already said so.
 
 The mechanism is **federated identity credentials**. An app registration or managed identity holds a collection of these, each one a distinct issuer, subject and audience triple. Creating a workload identity federation service connection adds one federated credential to the chosen identity, carrying that connection's own subject.
 
@@ -368,7 +368,9 @@ Three things the build settled that this report left open:
 Some of the files cited above no longer exist. `azure-pipeline.yml`, `WORKING_EXAMPLE.md`,
 `DIAGRAMS.md`, `policy.hcl`, `bound-claims.json`, `samples/vault-config-using-terraform.md` and
 `samples/azure-pipelines-vault.yml` were withdrawn on 23 September 2026 rather than corrected: each one taught the access-token design end to
-end, and a half-corrected copy is worse than none. The line references in this report are to the repository
+end, and a half-corrected copy is worse than none. The advanced document cited above survived, rewritten:
+it is now [`manual-setup/ADVANCED_CONFIG.md`](manual-setup/ADVANCED_CONFIG.md), and it no longer says any
+of what this report quotes it as saying. The line references in this report are to the repository
 as it stood when the review was written, and git history still holds every one of them.
 
 One constraint found while resolving the plugin federation question deserves early attention: plugin workload identity federation requires **AWS to reach Vault's own OIDC issuer endpoint** to fetch its JWKS. A private Vault cluster cannot satisfy this, and a public one advertises a port, which AWS documentation says an OIDC provider URL should not contain.

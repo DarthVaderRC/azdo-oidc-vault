@@ -9,14 +9,14 @@ There are two things in this repository, and they are not equal.
 | | What it is | State |
 |---|---|---|
 | [`terraform/`](terraform/), [`pipelines/`](pipelines/), [`demo/`](demo/) | Terraform, a pipeline template and the scripts that prove it, built and run end to end | **Tested.** Start here |
-| [`docs/manual-setup/`](docs/manual-setup/) | A manual, click-and-curl walkthrough written earlier | Older design, being corrected. See below |
+| [`docs/manual-setup/`](docs/manual-setup/) | The same design as a manual, click-and-curl walkthrough, for reading rather than running | Rewritten against the tested build |
 
 ## The earlier guidance is withdrawn
 
-The guides in `docs/manual-setup/` describe a design built on an **Azure Resource Manager access token**: the pipeline
-calls `az account get-access-token`, and Vault validates a token issued by `sts.windows.net` for the
-`https://management.core.windows.net/` audience. That works, and it is what the first version of this
-repository recommended.
+Until 23 September 2026 this repository recommended a design built on an **Azure Resource Manager
+access token**: the pipeline calls `az account get-access-token`, and Vault validates a token issued by
+`sts.windows.net` for the `https://management.core.windows.net/` audience. That works, and it removes
+stored credentials.
 
 It has two problems, and one of them cannot be fixed.
 
@@ -27,9 +27,12 @@ sprawl this was meant to remove.
 
 **It is being retired.** Azure DevOps ends support for that issuer on 1 July 2027.
 
-The guidance in those files also optimised for **Vault client count**, treating fewer entities as the
-goal. That framing is gone. Client count is a licensing consequence of a design, not a security
-property, and shaping authorisation around it produces roles that are deliberately too broad.
+That guidance also optimised for **Vault client count**, treating fewer entities as the goal. That
+framing is gone. Client count is a licensing consequence of a design, not a security property, and
+shaping authorisation around it produces roles that are deliberately too broad.
+
+Every guide in `docs/manual-setup/` has since been rewritten against the tested build, and seven
+files that taught the old design end to end were withdrawn rather than corrected.
 
 What replaced it, and the reasoning including the options rejected along the way, is in
 [docs/DESIGN_REVIEW.md](docs/DESIGN_REVIEW.md).
@@ -116,8 +119,9 @@ docs/
   VALIDATION.md       what was measured, with the nine acceptance tests
   DEMONSTRATING.md    how to demonstrate this live
   DESIGN_REVIEW.md    the design argument, and what was rejected
-  COMMON_PITFALLS.md  troubleshooting, partly corrected
-  manual-setup/       STEP_1 to STEP_5, the older design, being corrected
+  COMMON_PITFALLS.md  troubleshooting: symptoms, causes and the reasoning
+  manual-setup/       STEP_1 to STEP_5, the manual path, and
+                      ADVANCED_CONFIG.md, the decisions you revisit at scale
 ```
 
 ## Prerequisites

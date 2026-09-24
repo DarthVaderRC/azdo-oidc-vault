@@ -18,14 +18,20 @@ access token**: the pipeline calls `az account get-access-token`, and Vault vali
 `sts.windows.net` for the `https://management.core.windows.net/` audience. That works, and it removes
 stored credentials.
 
-It has two problems, and one of them cannot be fixed.
+It has one problem, and it cannot be fixed.
 
 **It cannot tell two pipelines apart.** An access token describes the managed identity and nothing
 else. Two pipelines sharing an identity produce identical tokens, so Vault cannot give them different
 roles. The only way to separate them is one identity per pipeline, which is the standing-credential
 sprawl this was meant to remove.
 
-**It is being retired.** Azure DevOps ends support for that issuer on 1 July 2027.
+Note that Microsoft's retirement of the Azure DevOps issuer `https://vstoken.dev.azure.com` on
+1 July 2027 is **not** a second reason. That retirement applies to the federated credential on a
+workload identity federation service connection, which both designs use, so it separates neither. It
+is also not the `sts.windows.net` issuer an access token carries, which Microsoft has announced no
+end of life for. What it does mean is that a connection must be on the Entra issuer, which is what the
+tested design needs anyway and what new connections already get by default. The dates and the exact
+scope are in [docs/DESIGN_REVIEW.md](docs/DESIGN_REVIEW.md).
 
 That guidance also optimised for **Vault client count**, treating fewer entities as the goal. That
 framing is gone. Client count is a licensing consequence of a design, not a security property, and

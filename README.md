@@ -30,34 +30,18 @@ What replaced it, and the reasoning including the options rejected along the way
 A pipeline asks Azure DevOps for an **Entra-issued ID token for its own service connection**. The subject Entra writes into that token names the *connection*, not the identity behind it. That single difference is what makes everything else possible: one managed identity can back many connections, and Vault can still bind a role to one exact pipeline.
 
 ```mermaid
-flowchart TD
-  subgraph ado["Azure DevOps"]
-    A["Pipeline A job<br/>no secret in the definition"]
-    B["Pipeline B job<br/>its own connection and role"]
-  end
+flowchart LR
+  A["Pipeline A"]
+  B["Pipeline B"]
+  E["Entra ID<br/>ID token, its subject names<br/>the service connection"]
+  V["Vault<br/>one role bound to<br/>one connection"]
+  W[("AWS<br/>credential created on demand,<br/>gone when the job ends")]
+  NO(["refused"])
 
-  subgraph entra["Entra ID, your tenant"]
-    MI["One managed identity<br/>one federated credential per connection, 20 at most"]
-    T["ID token<br/>iss: your tenant, v2.0<br/>aud: fb60f99c-7a34-...<br/>sub: .../sc/org/connection-A"]
-  end
-
-  subgraph vlt["Vault"]
-    JWT["JWT auth mount<br/>bound_issuer and bound_audiences, checked first"]
-    RA["Role pipeline-a<br/>bound_claims.sub = connection A<br/>token: 5 minutes, 2 uses"]
-    ENG["AWS secrets engine<br/>credential_type = iam_user"]
-  end
-
-  W[("AWS<br/>IAM user created on demand,<br/>deleted when the job revokes")]
-  NO(["refused, claims mismatch"])
-
-  A -->|"1 a token for my own service connection"| MI
-  MI -->|"2 federated credential"| T
-  T -->|"3 login, naming role pipeline-a"| JWT
-  JWT -->|"4 the subject must match exactly"| RA
-  RA -->|"5 Vault token, then read aws/creds/pipeline-a"| ENG
-  ENG -->|"6 create"| W
-  B -.->|"offers its token to a sibling's role"| RA
-  RA -.-> NO
+  A --> E --> V --> W
+  B --> E
+  B -.->|"a sibling's role"| V
+  V -.-> NO
 ```
 
 A pipeline that offers its token to a sibling's role is refused, because the subject does not match. That refusal is one of the acceptance tests, not a claim.

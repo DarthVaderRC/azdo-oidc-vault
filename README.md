@@ -51,14 +51,34 @@ difference is what makes everything else possible: one managed identity can back
 and Vault can still bind a role to one exact pipeline.
 
 ```mermaid
-flowchart LR
-  Job["Pipeline job"] -->|"1. token for my service connection"| ADO["Azure DevOps"]
-  ADO -->|"2. federated identity credential"| Entra["Entra ID"]
-  Entra -->|"3. ID token whose subject names the connection"| Job
-  Job -->|"4. login, naming its own role"| Vault["Vault JWT auth"]
-  Vault -->|"5. subject must match exactly"| Role["One role per pipeline"]
-  Role -->|"6. token: 5 minutes, 2 uses"| Engine["AWS secrets engine"]
-  Engine -->|"7. dynamic IAM user"| AWS[("AWS")]
+flowchart TD
+  subgraph ado["Azure DevOps"]
+    A["Pipeline A job<br/>no secret in the definition"]
+    B["Pipeline B job<br/>its own connection and role"]
+  end
+
+  subgraph entra["Entra ID, your tenant"]
+    MI["One managed identity<br/>one federated credential per connection, 20 at most"]
+    T["ID token<br/>iss: your tenant, v2.0<br/>aud: fb60f99c-7a34-...<br/>sub: .../sc/org/connection-A"]
+  end
+
+  subgraph vlt["Vault"]
+    JWT["JWT auth mount<br/>bound_issuer and bound_audiences, checked first"]
+    RA["Role pipeline-a<br/>bound_claims.sub = connection A<br/>token: 5 minutes, 2 uses"]
+    ENG["AWS secrets engine<br/>credential_type = iam_user"]
+  end
+
+  W[("AWS<br/>IAM user created on demand,<br/>deleted when the job revokes")]
+  NO(["refused, claims mismatch"])
+
+  A -->|"1 a token for my own service connection"| MI
+  MI -->|"2 federated credential"| T
+  T -->|"3 login, naming role pipeline-a"| JWT
+  JWT -->|"4 the subject must match exactly"| RA
+  RA -->|"5 Vault token, then read aws/creds/pipeline-a"| ENG
+  ENG -->|"6 create"| W
+  B -.->|"offers its token to a sibling's role"| RA
+  RA -.-> NO
 ```
 
 A pipeline that offers its token to a sibling's role is refused, because the subject does not match.
@@ -69,18 +89,33 @@ The credential that comes back is created on demand and destroyed by the job tha
 ```mermaid
 sequenceDiagram
   autonumber
-  participant Job as Pipeline job
+  participant Job as Pipeline A job
+  participant ADO as Azure DevOps
+  participant Entra as Entra ID
   participant Vault
   participant AWS
-  Job->>Vault: login with the ID token and a role name
-  Vault-->>Job: Vault token, 300 second TTL, 2 uses
-  Job->>Vault: read the AWS role
+
+  Note over AWS: no IAM user exists yet
+  Job->>ADO: a token for connection A
+  ADO->>Entra: the federated credential
+  Entra-->>Job: ID token, sub names connection A
+  Job->>Vault: login, role pipeline-a
+  activate Vault
+  Vault->>Vault: check iss, aud and sub
+  Vault-->>Job: Vault token, 300 s, 2 uses
+  Job->>Vault: read aws/creds/pipeline-a, use 1
   Vault->>AWS: create IAM user and access key
-  Vault-->>Job: access key and secret key
-  Job->>AWS: do the work it was authorised for
-  Job->>Vault: revoke its own token
+  AWS-->>Vault: access key and secret
+  Vault-->>Job: the credential, 15 minute lease
+  Note over Job,AWS: IAM is eventually consistent: retry the first call
+  Job->>AWS: the one action its policy allows
+  Job->>Vault: revoke its own token, use 2
   Vault->>AWS: delete the access key and the user
-  Note over Job,AWS: measured lifetime: 28 to 66 seconds
+  deactivate Vault
+  Note over AWS: nothing exists again: 28 to 66 s
+  opt the job is cancelled or crashes first
+    Note over Vault,AWS: no revoke runs: the 5 minute TTL ends it anyway
+  end
 ```
 
 If the job crashes, the five-minute TTL ends the lease anyway. Revocation is the fast path, not the
